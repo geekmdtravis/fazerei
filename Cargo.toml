@@ -1,13 +1,13 @@
 [package]
 name = "fazerei"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 description = "A simple CLI to-do app backed by SQLite"
 
 [dependencies]
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "unstable-ext"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 tabled = { version = "0.17", features = ["ansi"] }
 directories = "5"
-clap_complete = "4"
+clap_complete = { version = "4", features = ["unstable-dynamic"] }

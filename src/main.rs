@@ -4,7 +4,9 @@ mod models;
 use std::path::PathBuf;
 use std::process;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueHint};
+use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
+use clap_complete::CompleteEnv;
 use clap_complete::Shell;
 use tabled::{settings::Style, Table};
 
@@ -20,7 +22,7 @@ struct Cli {
     /// Path to the SQLite database file.
     /// Defaults to ~/.local/share/fazerei/fazerei.db
     /// Can also be set via FAZEREI_DB env var.
-    #[arg(long, global = true, env = "FAZEREI_DB")]
+    #[arg(long, global = true, env = "FAZEREI_DB", value_hint = ValueHint::FilePath)]
     db: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -77,13 +79,15 @@ enum Commands {
     /// Show full details of a to-do item
     Show {
         /// Database ID of the to-do item. Run `fazerei list` to see IDs.
-        id: i64,
+        #[arg(add = ArgValueCandidates::new(todo_id_candidates))]
+        id: Option<i64>,
     },
 
     /// Edit an existing to-do item (only specified fields are updated)
     Edit {
         /// Database ID of the to-do item. Run `fazerei list` to see IDs.
-        id: i64,
+        #[arg(add = ArgValueCandidates::new(todo_id_candidates))]
+        id: Option<i64>,
 
         /// New content
         #[arg(short, long)]
@@ -105,19 +109,22 @@ enum Commands {
     /// Mark a to-do item as done
     Done {
         /// Database ID of the to-do item. Run `fazerei list` to see IDs.
-        id: i64,
+        #[arg(add = ArgValueCandidates::new(pending_todo_id_candidates))]
+        id: Option<i64>,
     },
 
     /// Revert a to-do item to pending
     Undone {
         /// Database ID of the to-do item. Run `fazerei list` to see IDs.
-        id: i64,
+        #[arg(add = ArgValueCandidates::new(done_todo_id_candidates))]
+        id: Option<i64>,
     },
 
     /// Delete a to-do item permanently
     Rm {
         /// Database ID of the to-do item. Run `fazerei list` to see IDs.
-        id: i64,
+        #[arg(add = ArgValueCandidates::new(todo_id_candidates))]
+        id: Option<i64>,
     },
 
     /// Install shell tab completions
@@ -127,7 +134,7 @@ enum Commands {
         shell: Shell,
 
         /// Custom output path (optional)
-        #[arg(short, long)]
+        #[arg(short, long, value_hint = ValueHint::FilePath)]
         output: Option<std::path::PathBuf>,
     },
 }
@@ -147,6 +154,43 @@ fn default_db_path() -> PathBuf {
 
 fn resolve_db_path(cli_path: Option<PathBuf>) -> PathBuf {
     cli_path.unwrap_or_else(default_db_path)
+}
+
+fn complete_todo_id_impl(filter_done: Option<bool>) -> Vec<CompletionCandidate> {
+    let db_path = std::env::var("FAZEREI_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_db_path());
+    let Ok(conn) = db::open(&db_path) else {
+        return vec![];
+    };
+    let sql = match filter_done {
+        Some(true) => "SELECT id, content FROM todos WHERE done = 1 ORDER BY id",
+        Some(false) => "SELECT id, content FROM todos WHERE done = 0 ORDER BY id",
+        None => "SELECT id, content FROM todos ORDER BY id",
+    };
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return vec![];
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return vec![];
+    };
+    rows.filter_map(|r| r.ok())
+        .map(|(id, content)| CompletionCandidate::new(id.to_string()).help(Some(content.into())))
+        .collect()
+}
+
+fn todo_id_candidates() -> Vec<CompletionCandidate> {
+    complete_todo_id_impl(None)
+}
+
+fn pending_todo_id_candidates() -> Vec<CompletionCandidate> {
+    complete_todo_id_impl(Some(false))
+}
+
+fn done_todo_id_candidates() -> Vec<CompletionCandidate> {
+    complete_todo_id_impl(Some(true))
 }
 
 /// Parse a relative date shorthand (e.g. "0D", "1W", "-2M", "1Y") into its
@@ -464,76 +508,67 @@ fn cmd_rm(conn: &rusqlite::Connection, id: i64) {
 }
 
 fn cmd_install_completion(shell: Shell, output: Option<std::path::PathBuf>) {
-    let mut cmd = Cli::command();
     let bin_name = "fazerei";
 
-    let path = if let Some(p) = output {
-        p
-    } else {
-        let home = std::env::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        match shell {
-            Shell::Zsh => home.join(".local/share/zsh/site-functions/_fazerei"),
-            Shell::Bash => home.join(".local/share/bash-completion/completions/fazerei"),
-            Shell::Fish => home.join(".config/fish/completions/fazerei.fish"),
-            Shell::PowerShell => home.join(".local/share/powershell/Modules/fazerei"),
-            Shell::Elvish => home.join(".local/share/elvish/lib/fazerei.elv"),
-            _ => fail("unsupported shell"),
-        }
+    let completion_line = match shell {
+        Shell::Zsh => format!("source <(COMPLETE=zsh {})", bin_name),
+        Shell::Bash => format!("source <(COMPLETE=bash {})", bin_name),
+        Shell::Fish => format!("COMPLETE=fish {} | source", bin_name),
+        Shell::PowerShell => format!(
+            "$env:COMPLETE = \"powershell\"; {} | Out-String | Invoke-Expression",
+            bin_name
+        ),
+        Shell::Elvish => format!("eval (COMPLETE=elvish {} | slurp)", bin_name),
+        _ => fail("unsupported shell"),
     };
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .unwrap_or_else(|e| fail(&format!("failed to create directory: {e}")));
-    }
+    if let Some(path) = output {
+        let file_content = match shell {
+            Shell::Fish => completion_line.clone(),
+            _ => format!("# fazerei completion\n{}\n", completion_line),
+        };
 
-    let mut file = std::fs::File::create(&path)
-        .unwrap_or_else(|e| fail(&format!("failed to create file: {e}")));
-
-    clap_complete::generate(shell, &mut cmd, bin_name, &mut file);
-
-    println!("Completion script installed to: {}", path.display());
-
-    match shell {
-        Shell::Zsh => {
-            println!(
-                r#"
-IMPORTANT: The fpath line must be added BEFORE any existing `compinit` call!
-
-Add to your ~/.zshrc (before the existing compinit line):
-  fpath=(~/.local/share/zsh/site-functions $fpath)
-
-Then restart: exec zsh"#
-            );
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| fail(&format!("failed to create directory: {}", e)));
         }
-        Shell::Bash => {
-            println!(
-                r#"
-Add to your ~/.bashrc:
-  source ~/.local/share/bash-completion/completions/fazerei
-Then run: source ~/.bashrc"#
-            );
+
+        std::fs::write(&path, &file_content)
+            .unwrap_or_else(|e| fail(&format!("failed to write file: {}", e)));
+
+        println!("Completion script written to: {}", path.display());
+    } else {
+        match shell {
+            Shell::Zsh => {
+                println!("Add the following line to ~/.zshrc AFTER compinit:\n");
+                println!("  {}\n", completion_line);
+                println!(
+                    "For example:\n\n  \
+                     autoload -U compinit\n  \
+                     compinit\n  \
+                     {}\n",
+                    completion_line
+                );
+            }
+            Shell::Bash => {
+                println!("Add the following line to ~/.bashrc AFTER any bash-completion setup:\n");
+                println!("  {}\n", completion_line);
+            }
+            Shell::Fish => {
+                println!("Add the following line to ~/.config/fish/config.fish:\n");
+                println!("  {}\n", completion_line);
+            }
+            Shell::PowerShell => {
+                println!("Add the following line to your PowerShell profile:\n");
+                println!("  {}\n", completion_line);
+            }
+            Shell::Elvish => {
+                println!("Add the following line to ~/.elvish/rc.elv:\n");
+                println!("  {}\n", completion_line);
+            }
+            _ => fail("unsupported shell"),
         }
-        Shell::Fish => {
-            println!(
-                r#"
-Completions will be loaded automatically.
-Or run: source ~/.config/fish/completions/fazerei.fish"#
-            );
-        }
-        Shell::PowerShell => {
-            println!(
-                r#"
-Run: Import-Module ~/.local/share/powershell/Modules/fazerei"#
-            );
-        }
-        Shell::Elvish => {
-            println!(
-                r#"
-Add to your ~/.elvish/rc.elv:
-  use ~/.local/share/elvish/lib/fazerei.elv"#
-            );
-        }
-        _ => fail("unsupported shell"),
+        println!("Then restart your shell or source the config file.");
     }
 }
 
@@ -542,6 +577,7 @@ Add to your ~/.elvish/rc.elv:
 // ---------------------------------------------------------------------------
 
 fn main() {
+    CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
     let db_path = resolve_db_path(cli.db);
 
@@ -571,7 +607,8 @@ fn main() {
         } => {
             cmd_list(&conn, all, done, priority, due, count, simple);
         }
-        Commands::Show { id } => {
+        Commands::Show { id, .. } => {
+            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
             cmd_show(&conn, id);
         }
         Commands::Edit {
@@ -581,15 +618,19 @@ fn main() {
             due,
             notes,
         } => {
+            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
             cmd_edit(&conn, id, content, priority, due, notes);
         }
         Commands::Done { id } => {
+            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
             cmd_done(&conn, id);
         }
         Commands::Undone { id } => {
+            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
             cmd_undone(&conn, id);
         }
         Commands::Rm { id } => {
+            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
             cmd_rm(&conn, id);
         }
         Commands::InstallCompletion { shell, output } => {
