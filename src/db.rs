@@ -95,7 +95,7 @@ pub fn list(
         param_values.push(Box::new(date.to_string()));
     }
 
-    sql.push_str(" ORDER BY done ASC, priority ASC, due_date ASC NULLS LAST, created_at DESC");
+    sql.push_str(" ORDER BY done ASC, due_date ASC NULLS LAST, priority ASC, created_at DESC");
 
     let mut stmt = conn.prepare(&sql)?;
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
