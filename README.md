@@ -63,9 +63,9 @@ fazerei list                    # Pending items only
 fazerei list --all             # Show all (pending + done)
 fazerei list --done            # Show only completed
 fazerei list -p 1              # Filter by priority
-fazerei list --days 7          # Due within next 7 days (including overdue)
-fazerei list --weeks 2         # Due within next 2 weeks
-fazerei list --months 1         # Due within next month
+fazerei list -d 7d             # Due within next 7 days (including overdue)
+fazerei list --due 2w         # Due within next 2 weeks
+fazerei list --due 1m         # Due within next month
 ```
 
 ### `fazerei show <id>`
@@ -209,7 +209,7 @@ fazerei add "Code review" -p 2 -d 2D
 fazerei add "Update roadmap" -p 3 -d 1W
 
 # Focus on what's due soon
-fazerei list --days 3
+fazerei list -d 3d
 
 # Focus on high priority
 fazerei list -p 1

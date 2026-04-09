@@ -49,39 +49,35 @@ enum Commands {
     /// List to-do items (pending by default)
     List {
         /// Show all items (pending and done)
-        #[arg(long)]
+        #[arg(short, long)]
         all: bool,
 
         /// Show only completed items
-        #[arg(long)]
+        #[arg(short = 'D', long)]
         done: bool,
 
         /// Filter by priority level (1-5)
         #[arg(short, long)]
         priority: Option<u8>,
 
-        /// Show overdue + items due within the next N days
-        #[arg(long, conflicts_with_all = ["weeks", "months"])]
-        days: Option<u32>,
+        /// Show items due within this timeframe (e.g., 0d, 1d, 3w, 4m)
+        #[arg(short = 'd', long = "due", allow_hyphen_values = true)]
+        due: Option<String>,
 
-        /// Show overdue + items due within the next N weeks
-        #[arg(long, conflicts_with_all = ["days", "months"])]
-        weeks: Option<u32>,
-
-        /// Show overdue + items due within the next N months
-        #[arg(long, conflicts_with_all = ["days", "weeks"])]
-        months: Option<u32>,
+        /// Output only the count of matching items
+        #[arg(short = 'c', long = "count")]
+        count: bool,
     },
 
     /// Show full details of a to-do item
     Show {
-        /// ID of the to-do item
+        /// Database ID of the to-do item. Run `fazerei list` to see IDs.
         id: i64,
     },
 
     /// Edit an existing to-do item (only specified fields are updated)
     Edit {
-        /// ID of the to-do item
+        /// Database ID of the to-do item. Run `fazerei list` to see IDs.
         id: i64,
 
         /// New content
@@ -103,19 +99,19 @@ enum Commands {
 
     /// Mark a to-do item as done
     Done {
-        /// ID of the to-do item
+        /// Database ID of the to-do item. Run `fazerei list` to see IDs.
         id: i64,
     },
 
     /// Revert a to-do item to pending
     Undone {
-        /// ID of the to-do item
+        /// Database ID of the to-do item. Run `fazerei list` to see IDs.
         id: i64,
     },
 
     /// Delete a to-do item permanently
     Rm {
-        /// ID of the to-do item
+        /// Database ID of the to-do item. Run `fazerei list` to see IDs.
         id: i64,
     },
 }
@@ -248,9 +244,8 @@ fn cmd_list(
     all: bool,
     done: bool,
     priority: Option<u8>,
-    days: Option<u32>,
-    weeks: Option<u32>,
-    months: Option<u32>,
+    due: Option<String>,
+    count: bool,
 ) {
     if let Some(p) = priority {
         if let Err(e) = Priority::new(p) {
@@ -266,36 +261,64 @@ fn cmd_list(
         Some(false)
     };
 
-    // Compute cutoff date from --days, --weeks, or --months (mutually exclusive).
-    let due_before: Option<String> = if let Some(n) = days {
-        let target = chrono::Local::now()
-            .date_naive()
-            .checked_add_signed(chrono::Duration::days(n as i64))
-            .unwrap_or_else(|| fail("date overflow computing --days cutoff"));
-        Some(target.format("%Y-%m-%d").to_string())
-    } else if let Some(n) = weeks {
-        let target = chrono::Local::now()
-            .date_naive()
-            .checked_add_signed(chrono::Duration::weeks(n as i64))
-            .unwrap_or_else(|| fail("date overflow computing --weeks cutoff"));
-        Some(target.format("%Y-%m-%d").to_string())
-    } else if let Some(n) = months {
-        let target = chrono::Local::now()
-            .date_naive()
-            .checked_add_months(chrono::Months::new(n))
-            .unwrap_or_else(|| fail("date overflow computing --months cutoff"));
-        Some(target.format("%Y-%m-%d").to_string())
+    let due_before: Option<String> = if let Some(ref due_str) = due {
+        if let Some((n, unit)) = parse_relative(due_str) {
+            let today = chrono::Local::now().date_naive();
+            let target = match unit {
+                'D' => today
+                    .checked_add_signed(chrono::Duration::days(n))
+                    .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'"))),
+                'W' => today
+                    .checked_add_signed(chrono::Duration::weeks(n))
+                    .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'"))),
+                'M' => {
+                    if n >= 0 {
+                        today
+                            .checked_add_months(chrono::Months::new(n as u32))
+                            .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")))
+                    } else {
+                        today
+                            .checked_sub_months(chrono::Months::new(n.unsigned_abs() as u32))
+                            .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")))
+                    }
+                }
+                'Y' => {
+                    let months = n
+                        .checked_mul(12)
+                        .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")));
+                    if months >= 0 {
+                        today
+                            .checked_add_months(chrono::Months::new(months as u32))
+                            .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")))
+                    } else {
+                        today
+                            .checked_sub_months(chrono::Months::new(months.unsigned_abs() as u32))
+                            .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")))
+                    }
+                }
+                _ => fail(&format!("invalid unit '{unit}' in '{due_str}'")),
+            };
+            Some(target.format("%Y-%m-%d").to_string())
+        } else {
+            fail(&format!(
+                "invalid due filter '{due_str}' — expected relative format (e.g., 1d, 3w, 4m)"
+            ))
+        }
     } else {
         None
     };
 
     match db::list(conn, show_done, priority, due_before.as_deref()) {
         Ok(todos) => {
+            if count {
+                println!("{}", todos.len());
+                return;
+            }
             if todos.is_empty() {
                 println!("No to-do items found.");
                 return;
             }
-            let rows: Vec<TodoRow> = todos.iter().map(TodoRow::from).collect();
+            let rows: Vec<TodoRow> = todos.iter().map(TodoRow::new).collect();
             let table = Table::new(rows).with(Style::rounded()).to_string();
             println!("{table}");
         }
@@ -443,11 +466,10 @@ fn main() {
             all,
             done,
             priority,
-            days,
-            weeks,
-            months,
+            due,
+            count,
         } => {
-            cmd_list(&conn, all, done, priority, days, weeks, months);
+            cmd_list(&conn, all, done, priority, due, count);
         }
         Commands::Show { id } => {
             cmd_show(&conn, id);

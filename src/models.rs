@@ -65,7 +65,7 @@ impl Todo {
 /// Row type used by `tabled` for the list view.
 #[derive(Tabled)]
 pub struct TodoRow {
-    #[tabled(rename = "ID")]
+    #[tabled(rename = "#")]
     pub id: i64,
     #[tabled(rename = "")]
     pub status: String,
@@ -79,8 +79,8 @@ pub struct TodoRow {
     pub created_at: String,
 }
 
-impl From<&Todo> for TodoRow {
-    fn from(t: &Todo) -> Self {
+impl TodoRow {
+    pub fn new(t: &Todo) -> Self {
         let due_date = format_due_date(t.due_date.as_deref(), t.done);
         Self {
             id: t.id,
