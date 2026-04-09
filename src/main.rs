@@ -67,6 +67,10 @@ enum Commands {
         /// Output only the count of matching items
         #[arg(short = 'c', long = "count")]
         count: bool,
+
+        /// Simple output format for piping: "[x] - YYYY-MM-DD - ID - Content"
+        #[arg(short, long)]
+        simple: bool,
     },
 
     /// Show full details of a to-do item
@@ -246,6 +250,7 @@ fn cmd_list(
     priority: Option<u8>,
     due: Option<String>,
     count: bool,
+    simple: bool,
 ) {
     if let Some(p) = priority {
         if let Err(e) = Priority::new(p) {
@@ -316,6 +321,14 @@ fn cmd_list(
             }
             if todos.is_empty() {
                 println!("No to-do items found.");
+                return;
+            }
+            if simple {
+                for t in &todos {
+                    let status = if t.done { "[x]" } else { "[ ]" };
+                    let due = t.due_date.as_deref().unwrap_or("-");
+                    println!("{status} - {due} - {} - {}", t.id, t.content);
+                }
                 return;
             }
             let rows: Vec<TodoRow> = todos.iter().map(TodoRow::new).collect();
@@ -468,8 +481,9 @@ fn main() {
             priority,
             due,
             count,
+            simple,
         } => {
-            cmd_list(&conn, all, done, priority, due, count);
+            cmd_list(&conn, all, done, priority, due, count, simple);
         }
         Commands::Show { id } => {
             cmd_show(&conn, id);
