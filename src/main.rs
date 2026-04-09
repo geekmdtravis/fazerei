@@ -164,20 +164,36 @@ fn complete_todo_id_impl(filter_done: Option<bool>) -> Vec<CompletionCandidate> 
         return vec![];
     };
     let sql = match filter_done {
-        Some(true) => "SELECT id, content FROM todos WHERE done = 1 ORDER BY id",
-        Some(false) => "SELECT id, content FROM todos WHERE done = 0 ORDER BY id",
-        None => "SELECT id, content FROM todos ORDER BY id",
+        Some(true) => "SELECT id, content, notes, done, due_date, created_at FROM todos WHERE done = 1 ORDER BY due_date ASC NULLS LAST, priority ASC, created_at DESC",
+        Some(false) => "SELECT id, content, notes, done, due_date, created_at FROM todos WHERE done = 0 ORDER BY due_date ASC NULLS LAST, priority ASC, created_at DESC",
+        None => "SELECT id, content, notes, done, due_date, created_at FROM todos ORDER BY due_date ASC NULLS LAST, priority ASC, created_at DESC",
     };
     let Ok(mut stmt) = conn.prepare(sql) else {
         return vec![];
     };
     let Ok(rows) = stmt.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, String>(5)?,
+        ))
     }) else {
         return vec![];
     };
     rows.filter_map(|r| r.ok())
-        .map(|(id, content)| CompletionCandidate::new(id.to_string()).help(Some(content.into())))
+        .enumerate()
+        .map(|(i, (id, content, notes, done, due_date, created_at))| {
+            let date_str = due_date.as_deref().unwrap_or("no date");
+            let status = if done { "[x]" } else { "[ ]" };
+            let notes_str = notes.as_deref().unwrap_or("(no notes)");
+            let help = format!("{date_str} - {status} - {content} - {notes_str} - {created_at}");
+            CompletionCandidate::new(id.to_string())
+                .help(Some(help.into()))
+                .display_order(Some(i))
+        })
         .collect()
 }
 
@@ -522,9 +538,15 @@ fn cmd_install_completion(shell: Shell, output: Option<std::path::PathBuf>) {
         _ => fail("unsupported shell"),
     };
 
+    let nosort_line = "zstyle ':completion:*:*:fazerei:*:*' sort false";
+
     if let Some(path) = output {
         let file_content = match shell {
             Shell::Fish => completion_line.clone(),
+            Shell::Zsh => format!(
+                "# fazerei completion\n{}\n{}\n",
+                completion_line, nosort_line
+            ),
             _ => format!("# fazerei completion\n{}\n", completion_line),
         };
 
@@ -540,14 +562,16 @@ fn cmd_install_completion(shell: Shell, output: Option<std::path::PathBuf>) {
     } else {
         match shell {
             Shell::Zsh => {
-                println!("Add the following line to ~/.zshrc AFTER compinit:\n");
-                println!("  {}\n", completion_line);
+                println!("Add the following lines to ~/.zshrc AFTER compinit:\n");
+                println!("  {}", completion_line);
+                println!("  {}\n", nosort_line);
                 println!(
                     "For example:\n\n  \
                      autoload -U compinit\n  \
                      compinit\n  \
+                     {}\n  \
                      {}\n",
-                    completion_line
+                    completion_line, nosort_line
                 );
             }
             Shell::Bash => {
