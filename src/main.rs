@@ -4,7 +4,8 @@ mod models;
 use std::path::PathBuf;
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use tabled::{settings::Style, Table};
 
 use models::{Priority, TodoRow};
@@ -117,6 +118,17 @@ enum Commands {
     Rm {
         /// Database ID of the to-do item. Run `fazerei list` to see IDs.
         id: i64,
+    },
+
+    /// Install shell tab completions
+    InstallCompletion {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+
+        /// Custom output path (optional)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
     },
 }
 
@@ -451,6 +463,80 @@ fn cmd_rm(conn: &rusqlite::Connection, id: i64) {
     println!("Deleted to-do #{id}");
 }
 
+fn cmd_install_completion(shell: Shell, output: Option<std::path::PathBuf>) {
+    let mut cmd = Cli::command();
+    let bin_name = "fazerei";
+
+    let path = if let Some(p) = output {
+        p
+    } else {
+        let home = std::env::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        match shell {
+            Shell::Zsh => home.join(".local/share/zsh/site-functions/_fazerei"),
+            Shell::Bash => home.join(".local/share/bash-completion/completions/fazerei"),
+            Shell::Fish => home.join(".config/fish/completions/fazerei.fish"),
+            Shell::PowerShell => home.join(".local/share/powershell/Modules/fazerei"),
+            Shell::Elvish => home.join(".local/share/elvish/lib/fazerei.elv"),
+            _ => fail("unsupported shell"),
+        }
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| fail(&format!("failed to create directory: {e}")));
+    }
+
+    let mut file = std::fs::File::create(&path)
+        .unwrap_or_else(|e| fail(&format!("failed to create file: {e}")));
+
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut file);
+
+    println!("Completion script installed to: {}", path.display());
+
+    match shell {
+        Shell::Zsh => {
+            println!(
+                r#"
+IMPORTANT: The fpath line must be added BEFORE any existing `compinit` call!
+
+Add to your ~/.zshrc (before the existing compinit line):
+  fpath=(~/.local/share/zsh/site-functions $fpath)
+
+Then restart: exec zsh"#
+            );
+        }
+        Shell::Bash => {
+            println!(
+                r#"
+Add to your ~/.bashrc:
+  source ~/.local/share/bash-completion/completions/fazerei
+Then run: source ~/.bashrc"#
+            );
+        }
+        Shell::Fish => {
+            println!(
+                r#"
+Completions will be loaded automatically.
+Or run: source ~/.config/fish/completions/fazerei.fish"#
+            );
+        }
+        Shell::PowerShell => {
+            println!(
+                r#"
+Run: Import-Module ~/.local/share/powershell/Modules/fazerei"#
+            );
+        }
+        Shell::Elvish => {
+            println!(
+                r#"
+Add to your ~/.elvish/rc.elv:
+  use ~/.local/share/elvish/lib/fazerei.elv"#
+            );
+        }
+        _ => fail("unsupported shell"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -505,6 +591,9 @@ fn main() {
         }
         Commands::Rm { id } => {
             cmd_rm(&conn, id);
+        }
+        Commands::InstallCompletion { shell, output } => {
+            cmd_install_completion(shell, output);
         }
     }
 }

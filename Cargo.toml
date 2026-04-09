@@ -10,3 +10,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 tabled = { version = "0.17", features = ["ansi"] }
 directories = "5"
+clap_complete = "4"
