@@ -1,0 +1,12 @@
+[package]
+name = "fazerei"
+version = "0.1.0"
+edition = "2024"
+description = "A simple CLI to-do app backed by SQLite"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+tabled = { version = "0.17", features = ["ansi"] }
+directories = "5"
