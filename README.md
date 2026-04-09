@@ -4,19 +4,19 @@ A simple CLI to-do app backed by SQLite.
 
 ## Installation
 
-### From Crates.io
-
-```bash
-cargo install fazerei
-```
-
 ### From Source
 
 ```bash
+# Clone the repository
 git clone <repository-url>
 cd fazerei
+
+# Build for local use
 cargo build --release
 # Binary will be at target/release/fazerei
+
+# Or install globally (recommended)
+cargo install --path .
 ```
 
 ## Quick Start
@@ -56,7 +56,7 @@ fazerei add "Call mom" -d 2W -n "Sunday call"  # Due in 2 weeks, with notes
 
 ### `fazerei list`
 
-List to-do items. By default, shows only pending items.
+List to-do items. By default, shows only pending items. Use `--count` to output only the number of matching items. Overdue items (past due and not done) appear in **bold red** with an "OVERDUE" suffix.
 
 ```bash
 fazerei list                    # Pending items only
@@ -66,6 +66,7 @@ fazerei list -p 1              # Filter by priority
 fazerei list -d 7d             # Due within next 7 days (including overdue)
 fazerei list --due 2w         # Due within next 2 weeks
 fazerei list --due 1m         # Due within next month
+fazerei list --count          # Output only the count of matching items
 ```
 
 ### `fazerei show <id>`
@@ -154,7 +155,7 @@ fazerei add "Event" -d 2026-12-25
 
 By default, the database is stored at:
 - Linux/macOS: `~/.local/share/fazerei/fazerei.db`
-- Windows: `C:\Users\<user>\AppData\Local\fazerei\fazerei.db`
+- Windows: `C:\Users\<user>\AppData\Roaming\fazerei\fazerei.db`
 
 ### Custom Database Location
 
@@ -178,6 +179,8 @@ fazerei add "Task"
 | 3 | Medium (default) |
 | 4 | Low |
 | 5 | Lowest |
+
+**Note**: The `show` command displays priority as labels (e.g., "1 (highest)"), while the `list` command shows numeric values only.
 
 ## Examples
 
