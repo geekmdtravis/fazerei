@@ -86,6 +86,10 @@ enum Commands {
         /// Show day alongside date (e.g., Tuesday, December 31, 2015)
         #[arg(long)]
         full_date: bool,
+
+        /// Show priority as text (e.g., "1 (highest)")
+        #[arg(long)]
+        priority_text: bool,
     },
 
     /// Show full details of a to-do item
@@ -338,6 +342,7 @@ fn cmd_list(
     count: bool,
     simple: bool,
     full_date: bool,
+    priority_text: bool,
 ) {
     if let Some(p) = priority {
         if let Err(e) = Priority::new(p) {
@@ -478,11 +483,16 @@ fn cmd_list(
                     } else {
                         t.due_date.as_deref().unwrap_or("-").to_string()
                     };
-                    println!("{status} - {due} - {} - {}", t.id, t.content);
+                    let content = if priority_text {
+                        format!("{} ({})", t.content, t.priority.label())
+                    } else {
+                        t.content.clone()
+                    };
+                    println!("{status} - {due} - {} - {}", t.id, content);
                 }
                 return;
             }
-            let rows: Vec<TodoRow> = todos.iter().map(|t| TodoRow::new(t, full_date)).collect();
+            let rows: Vec<TodoRow> = todos.iter().map(|t| TodoRow::new(t, full_date, priority_text)).collect();
             let table = Table::new(rows).with(Style::rounded()).to_string();
             println!("{table}");
         }
@@ -710,6 +720,7 @@ fn main() {
             count,
             simple,
             full_date,
+            priority_text,
         } => {
             cmd_list(
                 &conn,
@@ -722,6 +733,7 @@ fn main() {
                 count,
                 simple,
                 full_date,
+                priority_text,
             );
         }
         Commands::Show { id, .. } => {

@@ -80,12 +80,12 @@ pub struct TodoRow {
 }
 
 impl TodoRow {
-    pub fn new(t: &Todo, full_date: bool) -> Self {
+    pub fn new(t: &Todo, full_date: bool, priority_text: bool) -> Self {
         let due_date = format_due_date(t.due_date.as_deref(), t.done, full_date);
         Self {
             id: t.id,
             status: t.status_icon().to_string(),
-            priority: t.priority.to_string(),
+            priority: if priority_text { t.priority.label().to_string() } else { t.priority.to_string() },
             content: truncate(&t.content, 50),
             due_date,
             created_at: t.created_at.clone(),
