@@ -60,12 +60,20 @@ enum Commands {
         done: bool,
 
         /// Filter by priority level (1-5)
-        #[arg(short, long)]
+        #[arg(long)]
         priority: Option<u8>,
 
         /// Show items due within this timeframe (e.g., 0d, 1d, 3w, 4m)
         #[arg(short = 'd', long = "due", allow_hyphen_values = true)]
         due: Option<String>,
+
+        /// Include done items from the past timeframe (e.g., 30d, 2w, 1m)
+        #[arg(short = 'p', long, allow_hyphen_values = true)]
+        past: Option<String>,
+
+        /// Include done items with no due date
+        #[arg(long)]
+        include_nodate: bool,
 
         /// Output only the count of matching items
         #[arg(short = 'c', long = "count")]
@@ -321,6 +329,8 @@ fn cmd_list(
     done: bool,
     priority: Option<u8>,
     due: Option<String>,
+    past: Option<String>,
+    include_nodate: bool,
     count: bool,
     simple: bool,
 ) {
@@ -330,13 +340,8 @@ fn cmd_list(
         }
     }
 
-    let show_done = if all {
-        None
-    } else if done {
-        Some(true)
-    } else {
-        Some(false)
-    };
+    let show_pending = !done;
+    let show_done = done || all;
 
     let due_before: Option<String> = if let Some(ref due_str) = due {
         if let Some((n, unit)) = parse_relative(due_str) {
@@ -385,7 +390,62 @@ fn cmd_list(
         None
     };
 
-    match db::list(conn, show_done, priority, due_before.as_deref()) {
+    let done_since: Option<String> = if let Some(ref past_str) = past {
+        if let Some((n, unit)) = parse_relative(past_str) {
+            let today = chrono::Local::now().date_naive();
+            let target = match unit {
+                'D' => today
+                    .checked_sub_signed(chrono::Duration::days(n))
+                    .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'"))),
+                'W' => today
+                    .checked_sub_signed(chrono::Duration::weeks(n))
+                    .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'"))),
+                'M' => {
+                    if n >= 0 {
+                        today
+                            .checked_sub_months(chrono::Months::new(n as u32))
+                            .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")))
+                    } else {
+                        today
+                            .checked_add_months(chrono::Months::new(n.unsigned_abs() as u32))
+                            .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")))
+                    }
+                }
+                'Y' => {
+                    let months = n
+                        .checked_mul(12)
+                        .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")));
+                    if months >= 0 {
+                        today
+                            .checked_sub_months(chrono::Months::new(months as u32))
+                            .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")))
+                    } else {
+                        today
+                            .checked_add_months(chrono::Months::new(months.unsigned_abs() as u32))
+                            .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")))
+                    }
+                }
+                _ => fail(&format!("invalid unit '{unit}' in '{past_str}'")),
+            };
+            Some(target.format("%Y-%m-%d").to_string())
+        } else {
+            fail(&format!(
+                "invalid past filter '{past_str}' — expected relative format (e.g., 30d, 2w, 1m)"
+            ))
+        }
+    } else {
+        None
+    };
+
+    match db::list(
+        conn,
+        show_pending,
+        show_done,
+        priority,
+        due_before.as_deref(),
+        done_since.as_deref(),
+        include_nodate,
+    ) {
         Ok(todos) => {
             if count {
                 println!("{}", todos.len());
@@ -626,10 +686,22 @@ fn main() {
             done,
             priority,
             due,
+            past,
+            include_nodate,
             count,
             simple,
         } => {
-            cmd_list(&conn, all, done, priority, due, count, simple);
+            cmd_list(
+                &conn,
+                all,
+                done,
+                priority,
+                due,
+                past,
+                include_nodate,
+                count,
+                simple,
+            );
         }
         Commands::Show { id, .. } => {
             let id = id.unwrap_or_else(|| fail("missing required argument: id"));

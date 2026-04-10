@@ -75,24 +75,94 @@ pub fn get(conn: &Connection, id: i64) -> SqlResult<Option<Todo>> {
 /// List to-dos with optional filters.
 pub fn list(
     conn: &Connection,
-    show_done: Option<bool>, // None = all, Some(true) = done only, Some(false) = pending only
+    show_pending: bool, // Show pending items
+    show_done: bool,    // Show done items
     priority_filter: Option<u8>,
-    due_before: Option<&str>, // If set, only items with a due_date <= this date (YYYY-MM-DD)
+    due_before: Option<&str>, // If set, items with due_date <= this date
+    done_since: Option<&str>, // If set, only done items with updated_at >= this date (YYYY-MM-DD)
+    include_nodate: bool,     // Include done items with no due date (only when show_done is true)
 ) -> SqlResult<Vec<Todo>> {
     let mut sql = String::from("SELECT * FROM todos WHERE 1=1");
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-    if let Some(done) = show_done {
-        sql.push_str(" AND done = ?");
-        param_values.push(Box::new(if done { 1i32 } else { 0i32 }));
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+
+    // Build the main status filter
+    if show_pending && !show_done {
+        sql.push_str(" AND done = 0");
+    } else if !show_pending && show_done {
+        sql.push_str(" AND done = 1");
+    } else if show_pending && show_done {
+        // --all: show all pending, and done items constrained by -d if given
+        let done_date_cond = if include_nodate {
+            "due_date IS NOT NULL"
+        } else {
+            "1=1"
+        };
+        if let Some(date) = due_before {
+            if let Some(since) = done_since {
+                // --all -d X -p Y: pending due <= date AND done updated_at >= since AND due <= date
+                sql.push_str(&format!(
+                    " AND (done = 0 OR done = 1 AND {} AND date(updated_at) >= '{}' AND due_date IS NOT NULL AND due_date <= '{}')",
+                    done_date_cond, since, date
+                ));
+            } else {
+                // With -d only: pending due <= date AND done due >= today AND <= date
+                sql.push_str(&format!(
+                    " AND (done = 0 OR done = 1 AND {} AND due_date >= '{}' AND due_date <= '{}')",
+                    done_date_cond, today, date
+                ));
+            }
+        } else if let Some(since) = done_since {
+            // --all -p Y: pending + done updated_at >= since (from past timeframe)
+            sql.push_str(&format!(
+                " AND (done = 0 OR done = 1 AND {} AND date(updated_at) >= '{}')",
+                done_date_cond, since
+            ));
+        } else {
+            // No -d: pending + done from today forward
+            sql.push_str(&format!(
+                " AND (done = 0 OR done = 1 AND {} AND due_date >= '{}')",
+                done_date_cond, today
+            ));
+        }
     }
+
     if let Some(pri) = priority_filter {
         sql.push_str(" AND priority = ?");
         param_values.push(Box::new(pri));
     }
-    if let Some(date) = due_before {
-        sql.push_str(" AND due_date IS NOT NULL AND due_date <= ?");
-        param_values.push(Box::new(date.to_string()));
+
+    // Apply due_before to pending items only (not done)
+    if show_pending && !show_done {
+        if let Some(date) = due_before {
+            sql.push_str(" AND due_date IS NOT NULL AND due_date <= ?");
+            param_values.push(Box::new(date.to_string()));
+        }
+    }
+
+    // Apply done_since filter for done items (and due constraint if no -p)
+    if show_done && !show_pending {
+        let done_date_cond = if include_nodate {
+            "due_date IS NOT NULL"
+        } else {
+            "1=1"
+        };
+        if done_since.is_none() {
+            // --done without --past: show done due >= today
+            sql.push_str(&format!(
+                " AND {} AND due_date >= '{}'",
+                done_date_cond, today
+            ));
+        } else if let Some(date) = done_since {
+            sql.push_str(&format!(
+                " AND {} AND date(updated_at) >= '{}'",
+                done_date_cond, date
+            ));
+        }
     }
 
     sql.push_str(" ORDER BY done ASC, due_date ASC NULLS LAST, priority ASC, created_at DESC");
