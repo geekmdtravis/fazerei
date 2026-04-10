@@ -90,43 +90,76 @@ pub fn list(
         .format("%Y-%m-%d")
         .to_string();
 
+    // When include_nodate is false, done items must have a due_date.
+    // When include_nodate is true, done items with NULL due_date are allowed through.
+    let nodate_filter = if include_nodate {
+        "1=1"
+    } else {
+        "due_date IS NOT NULL"
+    };
+
     // Build the main status filter
     if show_pending && !show_done {
+        // Pending only
         sql.push_str(" AND done = 0");
+        if let Some(date) = due_before {
+            sql.push_str(" AND due_date IS NOT NULL AND due_date <= ?");
+            param_values.push(Box::new(date.to_string()));
+        }
     } else if !show_pending && show_done {
+        // Done only (--done)
         sql.push_str(" AND done = 1");
-    } else if show_pending && show_done {
-        // --all: show all pending, and done items constrained by -d if given
-        let done_date_cond = if include_nodate {
-            "due_date IS NOT NULL"
+        if let Some(since) = done_since {
+            // --done -p Y: done items with updated_at >= since
+            sql.push_str(&format!(
+                " AND {} AND date(updated_at) >= '{}'",
+                nodate_filter, since
+            ));
+            if let Some(date) = due_before {
+                // --done -p Y -d X: also constrain due_date <= date
+                sql.push_str(&format!(
+                    " AND due_date IS NOT NULL AND due_date <= '{}'",
+                    date
+                ));
+            }
         } else {
-            "1=1"
-        };
+            // --done without -p: done items with due_date >= today
+            sql.push_str(&format!(
+                " AND {} AND due_date >= '{}'",
+                nodate_filter, today
+            ));
+            if let Some(date) = due_before {
+                // --done -d X: also constrain due_date <= date
+                sql.push_str(&format!(" AND due_date <= '{}'", date));
+            }
+        }
+    } else if show_pending && show_done {
+        // --all: pending + done
         if let Some(date) = due_before {
             if let Some(since) = done_since {
-                // --all -d X -p Y: pending due <= date AND done updated_at >= since AND due <= date
+                // --all -d X -p Y: pending due <= date, done updated_at >= since AND due <= date
                 sql.push_str(&format!(
-                    " AND (done = 0 OR done = 1 AND {} AND date(updated_at) >= '{}' AND due_date IS NOT NULL AND due_date <= '{}')",
-                    done_date_cond, since, date
+                    " AND ((done = 0 AND due_date IS NOT NULL AND due_date <= '{}') OR (done = 1 AND {} AND date(updated_at) >= '{}' AND due_date IS NOT NULL AND due_date <= '{}'))",
+                    date, nodate_filter, since, date
                 ));
             } else {
-                // With -d only: pending due <= date AND done due >= today AND <= date
+                // --all -d X: pending due <= date, done due >= today AND <= date
                 sql.push_str(&format!(
-                    " AND (done = 0 OR done = 1 AND {} AND due_date >= '{}' AND due_date <= '{}')",
-                    done_date_cond, today, date
+                    " AND ((done = 0 AND due_date IS NOT NULL AND due_date <= '{}') OR (done = 1 AND {} AND due_date >= '{}' AND due_date <= '{}'))",
+                    date, nodate_filter, today, date
                 ));
             }
         } else if let Some(since) = done_since {
-            // --all -p Y: pending + done updated_at >= since (from past timeframe)
+            // --all -p Y: all pending + done updated_at >= since
             sql.push_str(&format!(
-                " AND (done = 0 OR done = 1 AND {} AND date(updated_at) >= '{}')",
-                done_date_cond, since
+                " AND (done = 0 OR (done = 1 AND {} AND date(updated_at) >= '{}'))",
+                nodate_filter, since
             ));
         } else {
-            // No -d: pending + done from today forward
+            // --all (no flags): all pending + done due >= today
             sql.push_str(&format!(
-                " AND (done = 0 OR done = 1 AND {} AND due_date >= '{}')",
-                done_date_cond, today
+                " AND (done = 0 OR (done = 1 AND {} AND due_date >= '{}'))",
+                nodate_filter, today
             ));
         }
     }
@@ -134,35 +167,6 @@ pub fn list(
     if let Some(pri) = priority_filter {
         sql.push_str(" AND priority = ?");
         param_values.push(Box::new(pri));
-    }
-
-    // Apply due_before to pending items only (not done)
-    if show_pending && !show_done {
-        if let Some(date) = due_before {
-            sql.push_str(" AND due_date IS NOT NULL AND due_date <= ?");
-            param_values.push(Box::new(date.to_string()));
-        }
-    }
-
-    // Apply done_since filter for done items (and due constraint if no -p)
-    if show_done && !show_pending {
-        let done_date_cond = if include_nodate {
-            "due_date IS NOT NULL"
-        } else {
-            "1=1"
-        };
-        if done_since.is_none() {
-            // --done without --past: show done due >= today
-            sql.push_str(&format!(
-                " AND {} AND due_date >= '{}'",
-                done_date_cond, today
-            ));
-        } else if let Some(date) = done_since {
-            sql.push_str(&format!(
-                " AND {} AND date(updated_at) >= '{}'",
-                done_date_cond, date
-            ));
-        }
     }
 
     sql.push_str(" ORDER BY done ASC, due_date ASC NULLS LAST, priority ASC, created_at DESC");
