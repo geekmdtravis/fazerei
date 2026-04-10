@@ -80,8 +80,8 @@ pub struct TodoRow {
 }
 
 impl TodoRow {
-    pub fn new(t: &Todo) -> Self {
-        let due_date = format_due_date(t.due_date.as_deref(), t.done);
+    pub fn new(t: &Todo, full_date: bool) -> Self {
+        let due_date = format_due_date(t.due_date.as_deref(), t.done, full_date);
         Self {
             id: t.id,
             status: t.status_icon().to_string(),
@@ -96,25 +96,34 @@ impl TodoRow {
 /// Format the due-date cell for the list view.
 /// Overdue items (past due and not done) are shown in bold red with an
 /// "OVERDUE" suffix.
-fn format_due_date(due: Option<&str>, done: bool) -> String {
+fn format_due_date(due: Option<&str>, done: bool, full_date: bool) -> String {
     let Some(date_str) = due else {
         return "—".into();
     };
 
-    if done {
-        return date_str.to_string();
-    }
-
+    // Parse the date to check if overdue and optionally reformat
     let Ok(due_date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") else {
         return date_str.to_string();
     };
 
+    // Format date according to full_date flag
+    let formatted_date = if full_date {
+        due_date.format("%A, %B %d, %Y").to_string()
+    } else {
+        date_str.to_string()
+    };
+
+    if done {
+        return formatted_date;
+    }
+
     let today = chrono::Local::now().date_naive();
     if due_date < today {
         // Bold red: \x1b[1;31m ... \x1b[0m
-        format!("\x1b[1;31m{date_str} OVERDUE\x1b[0m")
+        // For overdue items, we need to preserve the formatted date
+        format!("\x1b[1;31m{formatted_date} OVERDUE\x1b[0m")
     } else {
-        date_str.to_string()
+        formatted_date
     }
 }
 

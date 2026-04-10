@@ -82,6 +82,10 @@ enum Commands {
         /// Simple output format for piping: "[x] - YYYY-MM-DD - ID - Content"
         #[arg(short, long)]
         simple: bool,
+
+        /// Show day alongside date (e.g., Tuesday, December 31, 2015)
+        #[arg(long)]
+        full_date: bool,
     },
 
     /// Show full details of a to-do item
@@ -333,6 +337,7 @@ fn cmd_list(
     include_nodate: bool,
     count: bool,
     simple: bool,
+    full_date: bool,
 ) {
     if let Some(p) = priority {
         if let Err(e) = Priority::new(p) {
@@ -458,12 +463,26 @@ fn cmd_list(
             if simple {
                 for t in &todos {
                     let status = if t.done { "[x]" } else { "[ ]" };
-                    let due = t.due_date.as_deref().unwrap_or("-");
+                    let due = if full_date {
+                        if let Some(date_str) = t.due_date.as_deref() {
+                            if let Ok(date) =
+                                chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                            {
+                                date.format("%A, %B %d, %Y").to_string()
+                            } else {
+                                date_str.to_string()
+                            }
+                        } else {
+                            "-".to_string()
+                        }
+                    } else {
+                        t.due_date.as_deref().unwrap_or("-").to_string()
+                    };
                     println!("{status} - {due} - {} - {}", t.id, t.content);
                 }
                 return;
             }
-            let rows: Vec<TodoRow> = todos.iter().map(TodoRow::new).collect();
+            let rows: Vec<TodoRow> = todos.iter().map(|t| TodoRow::new(t, full_date)).collect();
             let table = Table::new(rows).with(Style::rounded()).to_string();
             println!("{table}");
         }
@@ -690,6 +709,7 @@ fn main() {
             include_nodate,
             count,
             simple,
+            full_date,
         } => {
             cmd_list(
                 &conn,
@@ -701,6 +721,7 @@ fn main() {
                 include_nodate,
                 count,
                 simple,
+                full_date,
             );
         }
         Commands::Show { id, .. } => {
