@@ -92,11 +92,11 @@ enum Commands {
         priority_text: bool,
     },
 
-    /// Show full details of a to-do item
+    /// Show full details of one or more to-do items
     Show {
-        /// Database ID of the to-do item. Run `fazerei list` to see IDs.
-        #[arg(add = ArgValueCandidates::new(todo_id_candidates))]
-        id: Option<i64>,
+        /// Database IDs of the to-do items. Run `fazerei list` to see IDs.
+        #[arg(add = ArgValueCandidates::new(todo_id_candidates), required = true)]
+        ids: Vec<i64>,
     },
 
     /// Edit an existing to-do item (only specified fields are updated)
@@ -122,25 +122,25 @@ enum Commands {
         notes: Option<String>,
     },
 
-    /// Mark a to-do item as done
+    /// Mark one or more to-do items as done
     Done {
-        /// Database ID of the to-do item. Run `fazerei list` to see IDs.
-        #[arg(add = ArgValueCandidates::new(pending_todo_id_candidates))]
-        id: Option<i64>,
+        /// Database IDs of the to-do items. Run `fazerei list` to see IDs.
+        #[arg(add = ArgValueCandidates::new(pending_todo_id_candidates), required = true)]
+        ids: Vec<i64>,
     },
 
-    /// Revert a to-do item to pending
+    /// Revert one or more to-do items to pending
     Undone {
-        /// Database ID of the to-do item. Run `fazerei list` to see IDs.
-        #[arg(add = ArgValueCandidates::new(done_todo_id_candidates))]
-        id: Option<i64>,
+        /// Database IDs of the to-do items. Run `fazerei list` to see IDs.
+        #[arg(add = ArgValueCandidates::new(done_todo_id_candidates), required = true)]
+        ids: Vec<i64>,
     },
 
-    /// Delete a to-do item permanently
+    /// Delete one or more to-do items permanently
     Rm {
-        /// Database ID of the to-do item. Run `fazerei list` to see IDs.
-        #[arg(add = ArgValueCandidates::new(todo_id_candidates))]
-        id: Option<i64>,
+        /// Database IDs of the to-do items. Run `fazerei list` to see IDs.
+        #[arg(add = ArgValueCandidates::new(todo_id_candidates), required = true)]
+        ids: Vec<i64>,
     },
 
     /// Install shell tab completions
@@ -492,7 +492,10 @@ fn cmd_list(
                 }
                 return;
             }
-            let rows: Vec<TodoRow> = todos.iter().map(|t| TodoRow::new(t, full_date, priority_text)).collect();
+            let rows: Vec<TodoRow> = todos
+                .iter()
+                .map(|t| TodoRow::new(t, full_date, priority_text))
+                .collect();
             let table = Table::new(rows).with(Style::rounded()).to_string();
             println!("{table}");
         }
@@ -500,7 +503,7 @@ fn cmd_list(
     }
 }
 
-fn cmd_show(conn: &rusqlite::Connection, id: i64) {
+fn cmd_show_single(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
     match db::get(conn, id) {
         Ok(Some(t)) => {
             println!("ID:        {}", t.id);
@@ -511,9 +514,30 @@ fn cmd_show(conn: &rusqlite::Connection, id: i64) {
             println!("Notes:     {}", t.notes.as_deref().unwrap_or("—"));
             println!("Created:   {}", t.created_at);
             println!("Updated:   {}", t.updated_at);
+            Ok(())
         }
-        Ok(None) => fail(&format!("to-do #{id} not found")),
-        Err(e) => fail(&format!("failed to fetch to-do: {e}")),
+        Ok(None) => Err(format!("to-do #{id} not found")),
+        Err(e) => Err(format!("failed to fetch to-do: {e}")),
+    }
+}
+
+fn cmd_show_multi(conn: &rusqlite::Connection, ids: Vec<i64>) {
+    let mut errors = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        match cmd_show_single(conn, *id) {
+            Ok(()) => {}
+            Err(e) => errors.push((*id, e)),
+        }
+    }
+    if !errors.is_empty() {
+        eprintln!("Errors occurred:");
+        for (id, err) in errors {
+            eprintln!("  #{id}: {err}");
+        }
+        process::exit(1);
     }
 }
 
@@ -581,35 +605,85 @@ fn cmd_edit(
     }
 }
 
-fn cmd_done(conn: &rusqlite::Connection, id: i64) {
+fn cmd_done_single(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
     match db::get(conn, id) {
-        Ok(None) => fail(&format!("to-do #{id} not found")),
-        Err(e) => fail(&format!("failed to fetch to-do: {e}")),
+        Ok(None) => return Err(format!("to-do #{id} not found")),
+        Err(e) => return Err(format!("failed to fetch to-do: {e}")),
         Ok(Some(_)) => {}
     }
-    db::set_done(conn, id, true)
-        .unwrap_or_else(|e| fail(&format!("failed to mark to-do as done: {e}")));
-    println!("Marked to-do #{id} as done");
+    db::set_done(conn, id, true).map_err(|e| format!("failed to mark to-do as done: {e}"))?;
+    Ok(())
 }
 
-fn cmd_undone(conn: &rusqlite::Connection, id: i64) {
-    match db::get(conn, id) {
-        Ok(None) => fail(&format!("to-do #{id} not found")),
-        Err(e) => fail(&format!("failed to fetch to-do: {e}")),
-        Ok(Some(_)) => {}
+fn cmd_done_multi(conn: &rusqlite::Connection, ids: Vec<i64>) {
+    let mut errors = Vec::new();
+    for id in ids {
+        match cmd_done_single(conn, id) {
+            Ok(()) => println!("Marked to-do #{id} as done"),
+            Err(e) => errors.push((id, e)),
+        }
     }
-    db::set_done(conn, id, false).unwrap_or_else(|e| fail(&format!("failed to revert to-do: {e}")));
-    println!("Marked to-do #{id} as pending");
+    if !errors.is_empty() {
+        eprintln!("Errors occurred:");
+        for (id, err) in errors {
+            eprintln!("  #{id}: {err}");
+        }
+        process::exit(1);
+    }
 }
 
-fn cmd_rm(conn: &rusqlite::Connection, id: i64) {
+fn cmd_undone_single(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
     match db::get(conn, id) {
-        Ok(None) => fail(&format!("to-do #{id} not found")),
-        Err(e) => fail(&format!("failed to fetch to-do: {e}")),
+        Ok(None) => return Err(format!("to-do #{id} not found")),
+        Err(e) => return Err(format!("failed to fetch to-do: {e}")),
         Ok(Some(_)) => {}
     }
-    db::delete(conn, id).unwrap_or_else(|e| fail(&format!("failed to delete to-do: {e}")));
-    println!("Deleted to-do #{id}");
+    db::set_done(conn, id, false).map_err(|e| format!("failed to revert to-do: {e}"))?;
+    Ok(())
+}
+
+fn cmd_undone_multi(conn: &rusqlite::Connection, ids: Vec<i64>) {
+    let mut errors = Vec::new();
+    for id in ids {
+        match cmd_undone_single(conn, id) {
+            Ok(()) => println!("Marked to-do #{id} as pending"),
+            Err(e) => errors.push((id, e)),
+        }
+    }
+    if !errors.is_empty() {
+        eprintln!("Errors occurred:");
+        for (id, err) in errors {
+            eprintln!("  #{id}: {err}");
+        }
+        process::exit(1);
+    }
+}
+
+fn cmd_rm_single(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
+    match db::get(conn, id) {
+        Ok(None) => return Err(format!("to-do #{id} not found")),
+        Err(e) => return Err(format!("failed to fetch to-do: {e}")),
+        Ok(Some(_)) => {}
+    }
+    db::delete(conn, id).map_err(|e| format!("failed to delete to-do: {e}"))?;
+    Ok(())
+}
+
+fn cmd_rm_multi(conn: &rusqlite::Connection, ids: Vec<i64>) {
+    let mut errors = Vec::new();
+    for id in ids {
+        match cmd_rm_single(conn, id) {
+            Ok(()) => println!("Deleted to-do #{id}"),
+            Err(e) => errors.push((id, e)),
+        }
+    }
+    if !errors.is_empty() {
+        eprintln!("Errors occurred:");
+        for (id, err) in errors {
+            eprintln!("  #{id}: {err}");
+        }
+        process::exit(1);
+    }
 }
 
 fn cmd_install_completion(shell: Shell, output: Option<std::path::PathBuf>) {
@@ -736,9 +810,8 @@ fn main() {
                 priority_text,
             );
         }
-        Commands::Show { id, .. } => {
-            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
-            cmd_show(&conn, id);
+        Commands::Show { ids } => {
+            cmd_show_multi(&conn, ids);
         }
         Commands::Edit {
             id,
@@ -750,17 +823,14 @@ fn main() {
             let id = id.unwrap_or_else(|| fail("missing required argument: id"));
             cmd_edit(&conn, id, content, priority, due, notes);
         }
-        Commands::Done { id } => {
-            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
-            cmd_done(&conn, id);
+        Commands::Done { ids } => {
+            cmd_done_multi(&conn, ids);
         }
-        Commands::Undone { id } => {
-            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
-            cmd_undone(&conn, id);
+        Commands::Undone { ids } => {
+            cmd_undone_multi(&conn, ids);
         }
-        Commands::Rm { id } => {
-            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
-            cmd_rm(&conn, id);
+        Commands::Rm { ids } => {
+            cmd_rm_multi(&conn, ids);
         }
         Commands::InstallCompletion { shell, output } => {
             cmd_install_completion(shell, output);
