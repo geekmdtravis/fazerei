@@ -199,12 +199,74 @@ The JSON shape is the same as `fazerei list --json`. Export includes every item 
 
 ### `fazerei install-completion <shell>`
 
-Generate shell completions. Supports `bash`, `zsh`, `fish`, `powershell`, `elvish`. Pass `-o <path>` to write to a file.
+Install dynamic shell completions. Sourcing the activation line registers a hook that delegates completion back to `fazerei` at runtime, so TAB surfaces live data — real to-do IDs pulled from the current database, filtered by the subcommand — instead of a static snapshot.
+
+Two modes:
 
 ```bash
-fazerei install-completion zsh
+fazerei install-completion <shell>            # prints instructions
+fazerei install-completion <shell> -o <path>  # writes a sourceable file
+```
+
+Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+
+**Activation lines** (what the subcommand prints — copy these by hand if you prefer):
+
+| Shell | Line |
+|-------|------|
+| bash | `source <(COMPLETE=bash fazerei)` |
+| zsh | `source <(COMPLETE=zsh fazerei)` |
+| fish | `COMPLETE=fish fazerei \| source` |
+| powershell | `$env:COMPLETE = "powershell"; fazerei \| Out-String \| Invoke-Expression` |
+| elvish | `eval (COMPLETE=elvish fazerei \| slurp)` |
+
+**Zsh** also needs one extra line to stop zsh from alphabetically re-sorting candidates (so the order we set — nearest due date first — survives):
+
+```zsh
+zstyle ':completion:*:*:fazerei:*:*' sort false
+```
+
+The subcommand emits this automatically for zsh in both stdout and `-o` modes.
+
+**What completes:**
+
+- Subcommands, flags, and `<shell>` values.
+- `show` / `edit` / `rm` — any to-do ID.
+- `done` / `snooze` — pending IDs only.
+- `undone` — done IDs only.
+
+Each ID candidate carries a help string (shown inline in shells that support it): `<due> - <status> - <content…> - <notes…> - <created>`.
+
+**Examples**
+
+Bash — add to `~/.bashrc` after any bash-completion setup:
+
+```bash
+source <(COMPLETE=bash fazerei)
+```
+
+Zsh — add to `~/.zshrc` after `compinit`:
+
+```zsh
+autoload -U compinit
+compinit
+source <(COMPLETE=zsh fazerei)
+zstyle ':completion:*:*:fazerei:*:*' sort false
+```
+
+Write to a file instead (bash-completion drop-in):
+
+```bash
 fazerei install-completion bash -o ~/.local/share/bash-completion/completions/fazerei
 ```
+
+Fish auto-sources files in its completion dir:
+
+```bash
+fazerei install-completion fish -o ~/.config/fish/completions/fazerei.fish
+```
+
+Then restart the shell (or source the config file).
 
 ## Due date formats
 
