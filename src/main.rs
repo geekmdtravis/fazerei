@@ -10,7 +10,10 @@ use clap_complete::CompleteEnv;
 use clap_complete::Shell;
 use tabled::{settings::Style, Table};
 
-use models::{Priority, TodoRow};
+use models::{
+    format_ts_local, normalize_tags, render_json, render_json_value, render_parsable,
+    render_simple, Field, Priority, Sort, TodoRow,
+};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -33,8 +36,9 @@ struct Cli {
 enum Commands {
     /// Add a new to-do item
     Add {
-        /// The to-do content / description
-        content: String,
+        /// The to-do content / description (omitted when --stdin is used)
+        #[arg(required_unless_present = "stdin")]
+        content: Option<String>,
 
         /// Priority 1 (highest) to 5 (lowest)
         #[arg(short, long, default_value_t = 3)]
@@ -47,6 +51,20 @@ enum Commands {
         /// Optional notes
         #[arg(short, long)]
         notes: Option<String>,
+
+        /// Tags (comma-separated or repeated -t). Normalized to lowercase.
+        #[arg(short, long, value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+
+        /// Recurrence spec (e.g. 1D, 1W, 2M, 1Y). When the item is marked
+        /// done, a new instance is auto-created with due shifted by this.
+        #[arg(short = 'r', long)]
+        recur: Option<String>,
+
+        /// Read one to-do per line from stdin (content-only). Shared flags
+        /// (priority/due/notes/tags/recur) apply to every item.
+        #[arg(long, conflicts_with = "content")]
+        stdin: bool,
     },
 
     /// List to-do items (pending by default)
@@ -63,31 +81,77 @@ enum Commands {
         #[arg(long)]
         priority: Option<u8>,
 
-        /// Show items due within this timeframe (e.g., 0d, 1d, 3w, 4m)
-        #[arg(short = 'd', long = "due", allow_hyphen_values = true)]
+        /// Show items due on or before this date (YYYY-MM-DD or relative e.g. 1d, 3w, 4m)
+        #[arg(short = 'd', long = "due", allow_hyphen_values = true,
+              conflicts_with_all = ["overdue", "today", "week"])]
         due: Option<String>,
+
+        /// Shortcut: pending items past their due date
+        #[arg(long, conflicts_with_all = ["due", "today", "week", "done", "all"])]
+        overdue: bool,
+
+        /// Shortcut: items due today
+        #[arg(long, conflicts_with_all = ["due", "overdue", "week"])]
+        today: bool,
+
+        /// Shortcut: items due within the next 7 days
+        #[arg(long, conflicts_with_all = ["due", "overdue", "today"])]
+        week: bool,
 
         /// Include done items from the past timeframe (e.g., 30d, 2w, 1m)
         #[arg(short = 'p', long, allow_hyphen_values = true)]
         past: Option<String>,
 
+        /// Filter by tag (repeat or comma-separate for OR semantics)
+        #[arg(short = 't', long = "tag", value_delimiter = ',')]
+        tag: Vec<String>,
+
+        /// Case-insensitive substring search across content and notes
+        #[arg(long)]
+        search: Option<String>,
+
         /// Include done items with no due date
         #[arg(long)]
         include_nodate: bool,
 
+        /// Sort order
+        #[arg(long, value_enum, default_value_t = Sort::Due)]
+        sort: Sort,
+
+        /// Reverse the sort order
+        #[arg(short = 'R', long)]
+        reverse: bool,
+
         /// Output only the count of matching items
-        #[arg(short = 'c', long = "count")]
+        #[arg(short = 'c', long = "count", conflicts_with_all = ["simple", "parsable", "json"])]
         count: bool,
 
-        /// Simple output format for piping: "[x] - YYYY-MM-DD - ID - Content"
-        #[arg(short, long)]
+        /// Bare-bones display format: "[x] YYYY-MM-DD Content". Great for
+        /// status bars and hover menus. Invariant — not affected by
+        /// --full-date / --priority-text.
+        #[arg(short, long, conflicts_with_all = ["count", "parsable", "json"])]
         simple: bool,
 
-        /// Show day alongside date (e.g., Tuesday, December 31, 2015)
+        /// Machine-parsable output. Default fields: id,status,due,content.
+        /// Override with --fields. Single-space separated, `-` for nulls,
+        /// content / notes always come last.
+        #[arg(long, conflicts_with_all = ["count", "simple", "json"])]
+        parsable: bool,
+
+        /// Comma-separated list of fields for --parsable
+        /// (id,status,priority,due,updated,created,tags,content,notes)
+        #[arg(long, value_enum, value_delimiter = ',', requires = "parsable")]
+        fields: Option<Vec<Field>>,
+
+        /// JSON array output (one object per item).
+        #[arg(long, conflicts_with_all = ["count", "simple", "parsable"])]
+        json: bool,
+
+        /// Show day alongside date in the pretty view (e.g., Tuesday, December 31, 2015)
         #[arg(long)]
         full_date: bool,
 
-        /// Show priority as text (e.g., "1 (highest)")
+        /// Show priority as text (e.g., "1 (highest)") in the pretty view
         #[arg(long)]
         priority_text: bool,
     },
@@ -103,7 +167,7 @@ enum Commands {
     Edit {
         /// Database ID of the to-do item. Run `fazerei list` to see IDs.
         #[arg(add = ArgValueCandidates::new(todo_id_candidates))]
-        id: Option<i64>,
+        id: i64,
 
         /// New content
         #[arg(short, long)]
@@ -120,6 +184,14 @@ enum Commands {
         /// New notes, or "none" to clear
         #[arg(short, long)]
         notes: Option<String>,
+
+        /// Replace tags (comma-separated or repeated -t). Use "none" to clear.
+        #[arg(short, long, value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+
+        /// Replace recurrence spec (e.g. 1D, 1W). Use "none" to clear.
+        #[arg(short = 'r', long)]
+        recur: Option<String>,
     },
 
     /// Mark one or more to-do items as done
@@ -143,6 +215,55 @@ enum Commands {
         ids: Vec<i64>,
     },
 
+    /// Shift the due date of one or more items by a relative duration
+    Snooze {
+        /// Database IDs of the to-do items. Run `fazerei list` to see IDs.
+        #[arg(add = ArgValueCandidates::new(pending_todo_id_candidates), required = true)]
+        ids: Vec<i64>,
+
+        /// Duration to shift by (e.g. 1D, 1W, 2M, -3D). Forward by default.
+        #[arg(short = 'b', long, allow_hyphen_values = true)]
+        by: String,
+    },
+
+    /// Shortcut: list items due today (alias for `list --today`)
+    Today,
+
+    /// Show the single highest-priority pending item
+    Next,
+
+    /// Show summary statistics
+    Stats,
+
+    /// Delete completed items older than a relative cutoff
+    Prune {
+        /// Delete only done items (required for safety)
+        #[arg(long, required = true)]
+        done: bool,
+
+        /// Relative age cutoff (e.g. 30d, 2w, 1m). Done items whose
+        /// updated_at is strictly older than this will be removed.
+        #[arg(long = "older-than", value_name = "REL")]
+        older_than: String,
+
+        /// Preview what would be deleted without removing anything
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
+
+    /// Reverse the most recent mutation (rm, prune, edit, done, undone, snooze)
+    Undo,
+
+    /// Dump all to-dos to stdout as a JSON array
+    Export,
+
+    /// Import to-dos from a JSON array file (appends; assigns new ids)
+    Import {
+        /// Path to a JSON file produced by `fazerei export`.
+        #[arg(value_hint = ValueHint::FilePath)]
+        path: PathBuf,
+    },
+
     /// Install shell tab completions
     InstallCompletion {
         /// Shell to generate completions for
@@ -163,7 +284,6 @@ fn default_db_path() -> PathBuf {
     if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "fazerei") {
         proj_dirs.data_dir().join("fazerei.db")
     } else {
-        // Fallback: current directory
         PathBuf::from("fazerei.db")
     }
 }
@@ -204,8 +324,13 @@ fn complete_todo_id_impl(filter_done: Option<bool>) -> Vec<CompletionCandidate> 
         .map(|(i, (id, content, notes, done, due_date, created_at))| {
             let date_str = due_date.as_deref().unwrap_or("no date");
             let status = if done { "[x]" } else { "[ ]" };
-            let notes_str = notes.as_deref().unwrap_or("(no notes)");
-            let help = format!("{date_str} - {status} - {content} - {notes_str} - {created_at}");
+            let content_short = models::truncate(&content, 40);
+            let notes_short = notes
+                .as_deref()
+                .map(|n| models::truncate(n, 30))
+                .unwrap_or_else(|| "(no notes)".into());
+            let help =
+                format!("{date_str} - {status} - {content_short} - {notes_short} - {created_at}");
             CompletionCandidate::new(id.to_string())
                 .help(Some(help.into()))
                 .display_order(Some(i))
@@ -246,54 +371,53 @@ fn parse_relative(s: &str) -> Option<(i64, char)> {
     Some((n, unit))
 }
 
-/// Resolve a date string to an ISO 8601 date (YYYY-MM-DD).
-///
-/// Accepted formats:
-///   - Relative shorthand: `0D` (today), `1D` (tomorrow), `-1D` (yesterday),
-///     `1W` (+7 days), `2M` (+2 months), `1Y` (+1 year), etc.
-///   - Absolute ISO 8601: `2026-04-15`
-fn resolve_date(s: &str) -> Result<String, String> {
-    // Try relative shorthand first.
-    if let Some((n, unit)) = parse_relative(s) {
-        let today = chrono::Local::now().date_naive();
-        let target = match unit {
-            'D' => today
-                .checked_add_signed(chrono::Duration::days(n))
-                .ok_or_else(|| format!("date overflow for '{s}'"))?,
-            'W' => today
-                .checked_add_signed(chrono::Duration::weeks(n))
-                .ok_or_else(|| format!("date overflow for '{s}'"))?,
-            'M' => {
-                if n >= 0 {
-                    today
-                        .checked_add_months(chrono::Months::new(n as u32))
-                        .ok_or_else(|| format!("date overflow for '{s}'"))?
-                } else {
-                    today
-                        .checked_sub_months(chrono::Months::new(n.unsigned_abs() as u32))
-                        .ok_or_else(|| format!("date overflow for '{s}'"))?
-                }
+/// Apply a relative shift of `n` of `unit` to today and return ISO 8601.
+fn shift_today(n: i64, unit: char, original: &str) -> Result<String, String> {
+    let today = chrono::Local::now().date_naive();
+    let target = match unit {
+        'D' => today
+            .checked_add_signed(chrono::Duration::days(n))
+            .ok_or_else(|| format!("date overflow for '{original}'"))?,
+        'W' => today
+            .checked_add_signed(chrono::Duration::weeks(n))
+            .ok_or_else(|| format!("date overflow for '{original}'"))?,
+        'M' => {
+            if n >= 0 {
+                today
+                    .checked_add_months(chrono::Months::new(n as u32))
+                    .ok_or_else(|| format!("date overflow for '{original}'"))?
+            } else {
+                today
+                    .checked_sub_months(chrono::Months::new(n.unsigned_abs() as u32))
+                    .ok_or_else(|| format!("date overflow for '{original}'"))?
             }
-            'Y' => {
-                let months = n
-                    .checked_mul(12)
-                    .ok_or_else(|| format!("date overflow for '{s}'"))?;
-                if months >= 0 {
-                    today
-                        .checked_add_months(chrono::Months::new(months as u32))
-                        .ok_or_else(|| format!("date overflow for '{s}'"))?
-                } else {
-                    today
-                        .checked_sub_months(chrono::Months::new(months.unsigned_abs() as u32))
-                        .ok_or_else(|| format!("date overflow for '{s}'"))?
-                }
+        }
+        'Y' => {
+            let months = n
+                .checked_mul(12)
+                .ok_or_else(|| format!("date overflow for '{original}'"))?;
+            if months >= 0 {
+                today
+                    .checked_add_months(chrono::Months::new(months as u32))
+                    .ok_or_else(|| format!("date overflow for '{original}'"))?
+            } else {
+                today
+                    .checked_sub_months(chrono::Months::new(months.unsigned_abs() as u32))
+                    .ok_or_else(|| format!("date overflow for '{original}'"))?
             }
-            _ => unreachable!(),
-        };
-        return Ok(target.format("%Y-%m-%d").to_string());
-    }
+        }
+        _ => return Err(format!("invalid unit '{unit}' in '{original}'")),
+    };
+    Ok(target.format("%Y-%m-%d").to_string())
+}
 
-    // Fall back to absolute YYYY-MM-DD.
+/// Resolve a date string to ISO 8601. Accepts relative (0D, 1W, -2M) or
+/// absolute (YYYY-MM-DD). `sign` multiplies relative N (use -1 for --past,
+/// which treats positive N as "N ago").
+fn resolve_date_signed(s: &str, sign: i64) -> Result<String, String> {
+    if let Some((n, unit)) = parse_relative(s) {
+        return shift_today(n * sign, unit, s);
+    }
     chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map(|d| d.format("%Y-%m-%d").to_string())
         .map_err(|_| {
@@ -301,21 +425,65 @@ fn resolve_date(s: &str) -> Result<String, String> {
         })
 }
 
+/// Resolve a forward-direction date (relative or absolute).
+fn resolve_date(s: &str) -> Result<String, String> {
+    resolve_date_signed(s, 1)
+}
+
 fn fail(msg: &str) -> ! {
     eprintln!("error: {msg}");
     process::exit(1);
+}
+
+/// Validate a recurrence spec: must be a positive relative duration
+/// (e.g. 1D, 1W, 2M, 1Y). Returns the normalized (uppercased) form.
+fn validate_recurrence(s: &str) -> Result<String, String> {
+    let (n, unit) = parse_relative(s).ok_or_else(|| {
+        format!("invalid recurrence '{s}' — expected e.g. 1D, 1W, 2M, 1Y")
+    })?;
+    if n <= 0 {
+        return Err(format!(
+            "recurrence must be positive, got '{s}' ({n}{unit})"
+        ));
+    }
+    Ok(format!("{n}{unit}"))
+}
+
+/// Write an undo-journal entry, panicking if it fails. Intended to run
+/// inside an existing transaction.
+fn write_journal(conn: &rusqlite::Connection, action: &str, payload: &str, summary: &str) {
+    db::write_journal(conn, action, payload, summary)
+        .unwrap_or_else(|e| fail(&format!("failed to write undo journal: {e}")));
+}
+
+/// Given a due date and a recurrence spec, compute the next occurrence date.
+fn next_occurrence(due: &str, rec: &str) -> Option<String> {
+    let base = chrono::NaiveDate::parse_from_str(due, "%Y-%m-%d").ok()?;
+    let (n, unit) = parse_relative(rec)?;
+    let target = match unit {
+        'D' => base.checked_add_signed(chrono::Duration::days(n))?,
+        'W' => base.checked_add_signed(chrono::Duration::weeks(n))?,
+        'M' => base.checked_add_months(chrono::Months::new(n as u32))?,
+        'Y' => base.checked_add_months(chrono::Months::new((n * 12) as u32))?,
+        _ => return None,
+    };
+    Some(target.format("%Y-%m-%d").to_string())
 }
 
 // ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_add(
-    conn: &rusqlite::Connection,
-    content: String,
+    conn: &mut rusqlite::Connection,
+    content: Option<String>,
     priority: u8,
     due: String,
     notes: Option<String>,
+    tags: Option<Vec<String>>,
+    recur: Option<String>,
+    stdin: bool,
 ) {
     if let Err(e) = Priority::new(priority) {
         fail(&e);
@@ -324,23 +492,87 @@ fn cmd_add(
         Ok(d) => d,
         Err(e) => fail(&e),
     };
+    let tags_stored = tags.and_then(normalize_tags);
+    let recurrence = match recur.as_deref() {
+        Some(s) => Some(validate_recurrence(s).unwrap_or_else(|e| fail(&e))),
+        None => None,
+    };
 
-    match db::add(conn, &content, priority, Some(&resolved), notes.as_deref()) {
+    if stdin {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let lines: Vec<String> = stdin
+            .lock()
+            .lines()
+            .filter_map(|l| l.ok())
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if lines.is_empty() {
+            eprintln!("No input lines read from stdin.");
+            return;
+        }
+        let tx = conn
+            .transaction()
+            .unwrap_or_else(|e| fail(&format!("failed to start transaction: {e}")));
+        let mut added = Vec::with_capacity(lines.len());
+        for line in lines {
+            let id = db::add(
+                &tx,
+                &line,
+                priority,
+                Some(&resolved),
+                notes.as_deref(),
+                tags_stored.as_deref(),
+                recurrence.as_deref(),
+            )
+            .unwrap_or_else(|e| fail(&format!("failed to add to-do: {e}")));
+            added.push(id);
+        }
+        tx.commit()
+            .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+        for id in added {
+            println!("Added to-do #{id}");
+        }
+        return;
+    }
+
+    let content = content.unwrap_or_else(|| fail("content required"));
+    match db::add(
+        conn,
+        &content,
+        priority,
+        Some(&resolved),
+        notes.as_deref(),
+        tags_stored.as_deref(),
+        recurrence.as_deref(),
+    ) {
         Ok(id) => println!("Added to-do #{id}"),
         Err(e) => fail(&format!("failed to add to-do: {e}")),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_list(
     conn: &rusqlite::Connection,
     all: bool,
     done: bool,
     priority: Option<u8>,
     due: Option<String>,
+    overdue: bool,
+    today_flag: bool,
+    week: bool,
     past: Option<String>,
+    tag: Vec<String>,
+    search: Option<String>,
     include_nodate: bool,
+    sort: Sort,
+    reverse: bool,
     count: bool,
     simple: bool,
+    parsable: bool,
+    fields: Option<Vec<Field>>,
+    json: bool,
     full_date: bool,
     priority_text: bool,
 ) {
@@ -350,157 +582,107 @@ fn cmd_list(
         }
     }
 
-    let show_pending = !done;
-    let show_done = done || all;
-
-    let due_before: Option<String> = if let Some(ref due_str) = due {
-        if let Some((n, unit)) = parse_relative(due_str) {
-            let today = chrono::Local::now().date_naive();
-            let target = match unit {
-                'D' => today
-                    .checked_add_signed(chrono::Duration::days(n))
-                    .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'"))),
-                'W' => today
-                    .checked_add_signed(chrono::Duration::weeks(n))
-                    .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'"))),
-                'M' => {
-                    if n >= 0 {
-                        today
-                            .checked_add_months(chrono::Months::new(n as u32))
-                            .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")))
-                    } else {
-                        today
-                            .checked_sub_months(chrono::Months::new(n.unsigned_abs() as u32))
-                            .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")))
-                    }
-                }
-                'Y' => {
-                    let months = n
-                        .checked_mul(12)
-                        .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")));
-                    if months >= 0 {
-                        today
-                            .checked_add_months(chrono::Months::new(months as u32))
-                            .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")))
-                    } else {
-                        today
-                            .checked_sub_months(chrono::Months::new(months.unsigned_abs() as u32))
-                            .unwrap_or_else(|| fail(&format!("date overflow for '{due_str}'")))
-                    }
-                }
-                _ => fail(&format!("invalid unit '{unit}' in '{due_str}'")),
-            };
-            Some(target.format("%Y-%m-%d").to_string())
-        } else {
-            fail(&format!(
-                "invalid due filter '{due_str}' — expected relative format (e.g., 1d, 3w, 4m)"
-            ))
-        }
+    // Status scope. --overdue forces pending-only (clap already excludes --done/--all).
+    let (show_pending, show_done) = if overdue {
+        (true, false)
     } else {
-        None
+        (!done, done || all)
     };
 
-    let done_since: Option<String> = if let Some(ref past_str) = past {
-        if let Some((n, unit)) = parse_relative(past_str) {
-            let today = chrono::Local::now().date_naive();
-            let target = match unit {
-                'D' => today
-                    .checked_sub_signed(chrono::Duration::days(n))
-                    .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'"))),
-                'W' => today
-                    .checked_sub_signed(chrono::Duration::weeks(n))
-                    .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'"))),
-                'M' => {
-                    if n >= 0 {
-                        today
-                            .checked_sub_months(chrono::Months::new(n as u32))
-                            .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")))
-                    } else {
-                        today
-                            .checked_add_months(chrono::Months::new(n.unsigned_abs() as u32))
-                            .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")))
-                    }
-                }
-                'Y' => {
-                    let months = n
-                        .checked_mul(12)
-                        .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")));
-                    if months >= 0 {
-                        today
-                            .checked_sub_months(chrono::Months::new(months as u32))
-                            .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")))
-                    } else {
-                        today
-                            .checked_add_months(chrono::Months::new(months.unsigned_abs() as u32))
-                            .unwrap_or_else(|| fail(&format!("date overflow for '{past_str}'")))
-                    }
-                }
-                _ => fail(&format!("invalid unit '{unit}' in '{past_str}'")),
-            };
-            Some(target.format("%Y-%m-%d").to_string())
-        } else {
-            fail(&format!(
-                "invalid past filter '{past_str}' — expected relative format (e.g., 30d, 2w, 1m)"
-            ))
-        }
+    // Date range: shortcuts override --due.
+    let today = chrono::Local::now().date_naive();
+    let (due_before, due_from) = if overdue {
+        let yesterday = today - chrono::Duration::days(1);
+        (Some(yesterday.format("%Y-%m-%d").to_string()), None)
+    } else if today_flag {
+        let d = today.format("%Y-%m-%d").to_string();
+        (Some(d.clone()), Some(d))
+    } else if week {
+        let week_out = today + chrono::Duration::days(7);
+        (
+            Some(week_out.format("%Y-%m-%d").to_string()),
+            Some(today.format("%Y-%m-%d").to_string()),
+        )
     } else {
-        None
+        let due_before = due
+            .as_deref()
+            .map(resolve_date)
+            .transpose()
+            .unwrap_or_else(|e| fail(&e));
+        (due_before, None)
     };
 
-    match db::list(
+    let done_since = past
+        .as_deref()
+        .map(|s| resolve_date_signed(s, -1))
+        .transpose()
+        .unwrap_or_else(|e| fail(&e));
+
+    // Normalize tag filter to lowercase, dedupe.
+    let tags_any: Vec<String> = {
+        let mut v: Vec<String> = tag
+            .into_iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+
+    let mut todos = db::list(
         conn,
         show_pending,
         show_done,
         priority,
         due_before.as_deref(),
+        due_from.as_deref(),
         done_since.as_deref(),
         include_nodate,
-    ) {
-        Ok(todos) => {
-            if count {
-                println!("{}", todos.len());
-                return;
-            }
-            if todos.is_empty() {
-                println!("No to-do items found.");
-                return;
-            }
-            if simple {
-                for t in &todos {
-                    let status = if t.done { "[x]" } else { "[ ]" };
-                    let due = if full_date {
-                        if let Some(date_str) = t.due_date.as_deref() {
-                            if let Ok(date) =
-                                chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                            {
-                                date.format("%A, %B %d, %Y").to_string()
-                            } else {
-                                date_str.to_string()
-                            }
-                        } else {
-                            "-".to_string()
-                        }
-                    } else {
-                        t.due_date.as_deref().unwrap_or("-").to_string()
-                    };
-                    let content = if priority_text {
-                        format!("{} ({})", t.content, t.priority.label())
-                    } else {
-                        t.content.clone()
-                    };
-                    println!("{status} - {due} - {} - {}", t.id, content);
-                }
-                return;
-            }
-            let rows: Vec<TodoRow> = todos
-                .iter()
-                .map(|t| TodoRow::new(t, full_date, priority_text))
-                .collect();
-            let table = Table::new(rows).with(Style::rounded()).to_string();
-            println!("{table}");
-        }
-        Err(e) => fail(&format!("failed to list to-dos: {e}")),
+        &tags_any,
+        search.as_deref(),
+        sort,
+    )
+    .unwrap_or_else(|e| fail(&format!("failed to list to-dos: {e}")));
+
+    if reverse {
+        todos.reverse();
     }
+
+    if count {
+        println!("{}", todos.len());
+        return;
+    }
+    if json {
+        let objs: Vec<String> = todos.iter().map(render_json).collect();
+        println!("[{}]", objs.join(","));
+        return;
+    }
+    if todos.is_empty() {
+        if !parsable && !simple {
+            println!("No to-do items found.");
+        }
+        return;
+    }
+    if parsable {
+        let effective = fields.unwrap_or_else(Field::defaults);
+        for t in &todos {
+            println!("{}", render_parsable(t, &effective));
+        }
+        return;
+    }
+    if simple {
+        for t in &todos {
+            println!("{}", render_simple(t));
+        }
+        return;
+    }
+    let rows: Vec<TodoRow> = todos
+        .iter()
+        .map(|t| TodoRow::new(t, full_date, priority_text))
+        .collect();
+    let table = Table::new(rows).with(Style::rounded()).to_string();
+    println!("{table}");
 }
 
 fn cmd_show_single(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
@@ -511,9 +693,17 @@ fn cmd_show_single(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
             println!("Priority:  {}", t.priority.label());
             println!("Content:   {}", t.content);
             println!("Due:       {}", t.due_date.as_deref().unwrap_or("—"));
+            let tags_v = t.tags_vec();
+            let tags_str = if tags_v.is_empty() {
+                "—".to_string()
+            } else {
+                tags_v.join(", ")
+            };
+            println!("Tags:      {tags_str}");
+            println!("Recur:     {}", t.recurrence.as_deref().unwrap_or("—"));
             println!("Notes:     {}", t.notes.as_deref().unwrap_or("—"));
-            println!("Created:   {}", t.created_at);
-            println!("Updated:   {}", t.updated_at);
+            println!("Created:   {}", format_ts_local(&t.created_at));
+            println!("Updated:   {}", format_ts_local(&t.updated_at));
             Ok(())
         }
         Ok(None) => Err(format!("to-do #{id} not found")),
@@ -541,149 +731,617 @@ fn cmd_show_multi(conn: &rusqlite::Connection, ids: Vec<i64>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_edit(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     id: i64,
     content: Option<String>,
     priority: Option<u8>,
     due: Option<String>,
     notes: Option<String>,
+    tags: Option<Vec<String>>,
+    recur: Option<String>,
 ) {
-    // Verify it exists first.
-    match db::get(conn, id) {
+    if content.is_none()
+        && priority.is_none()
+        && due.is_none()
+        && notes.is_none()
+        && tags.is_none()
+        && recur.is_none()
+    {
+        eprintln!("Nothing to update. Specify at least one field to change.");
+        eprintln!("Run `fazerei edit --help` for usage.");
+        process::exit(1);
+    }
+
+    // Pre-validate: the row exists and the values are valid. This happens
+    // outside the transaction so we fail fast without an open tx.
+    let before = match db::get(conn, id) {
+        Ok(Some(t)) => t,
         Ok(None) => fail(&format!("to-do #{id} not found")),
         Err(e) => fail(&format!("failed to fetch to-do: {e}")),
-        Ok(Some(_)) => {}
-    }
-
-    let mut updated = false;
-
-    if let Some(ref c) = content {
-        db::update_content(conn, id, c)
-            .unwrap_or_else(|e| fail(&format!("failed to update content: {e}")));
-        updated = true;
-    }
+    };
     if let Some(p) = priority {
         if let Err(e) = Priority::new(p) {
             fail(&e);
         }
-        db::update_priority(conn, id, p)
-            .unwrap_or_else(|e| fail(&format!("failed to update priority: {e}")));
-        updated = true;
     }
-    if let Some(ref d) = due {
-        let due_val = if d.eq_ignore_ascii_case("none") {
-            None
+    let resolved_due = due.as_deref().map(|d| {
+        if d.eq_ignore_ascii_case("none") {
+            Ok::<Option<String>, String>(None)
         } else {
-            let resolved = match resolve_date(d) {
-                Ok(r) => r,
-                Err(e) => fail(&e),
-            };
-            Some(resolved)
-        };
-        db::update_due_date(conn, id, due_val.as_deref())
-            .unwrap_or_else(|e| fail(&format!("failed to update due date: {e}")));
-        updated = true;
+            resolve_date(d).map(Some)
+        }
+    });
+    let resolved_due = match resolved_due {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => fail(&e),
+        None => None,
+    };
+    let resolved_recur = match recur.as_deref() {
+        Some(s) if s.eq_ignore_ascii_case("none") => Some(None),
+        Some(s) => Some(Some(
+            validate_recurrence(s).unwrap_or_else(|e| fail(&e)),
+        )),
+        None => None,
+    };
+
+    let tx = conn
+        .transaction()
+        .unwrap_or_else(|e| fail(&format!("failed to start transaction: {e}")));
+
+    if let Some(c) = content.as_ref() {
+        db::update_content(&tx, id, c)
+            .unwrap_or_else(|e| fail(&format!("failed to update content: {e}")));
     }
-    if let Some(ref n) = notes {
+    if let Some(p) = priority {
+        db::update_priority(&tx, id, p)
+            .unwrap_or_else(|e| fail(&format!("failed to update priority: {e}")));
+    }
+    if let Some(due_val) = resolved_due.as_ref() {
+        db::update_due_date(&tx, id, due_val.as_deref())
+            .unwrap_or_else(|e| fail(&format!("failed to update due date: {e}")));
+    }
+    if let Some(n) = notes.as_ref() {
         let notes_val = if n.eq_ignore_ascii_case("none") {
             None
         } else {
             Some(n.as_str())
         };
-        db::update_notes(conn, id, notes_val)
+        db::update_notes(&tx, id, notes_val)
             .unwrap_or_else(|e| fail(&format!("failed to update notes: {e}")));
-        updated = true;
+    }
+    if let Some(t) = tags.as_ref() {
+        // A single literal "none" entry clears all tags.
+        let is_clear = t.len() == 1 && t[0].eq_ignore_ascii_case("none");
+        let stored = if is_clear {
+            None
+        } else {
+            normalize_tags(t.iter().cloned())
+        };
+        db::update_tags(&tx, id, stored.as_deref())
+            .unwrap_or_else(|e| fail(&format!("failed to update tags: {e}")));
+    }
+    if let Some(rec_opt) = resolved_recur.as_ref() {
+        db::update_recurrence(&tx, id, rec_opt.as_deref())
+            .unwrap_or_else(|e| fail(&format!("failed to update recurrence: {e}")));
     }
 
-    if updated {
-        println!("Updated to-do #{id}");
+    write_journal(
+        &tx,
+        "edit",
+        &serde_json::json!({"before": render_json_value(&before)}).to_string(),
+        &format!("edit #{id}"),
+    );
+
+    tx.commit()
+        .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+    println!("Updated to-do #{id}");
+}
+
+fn cmd_done_multi(conn: &mut rusqlite::Connection, ids: Vec<i64>, done_state: bool) {
+    let tx = conn
+        .transaction()
+        .unwrap_or_else(|e| fail(&format!("failed to start transaction: {e}")));
+
+    let mut errors = Vec::new();
+    let mut succeeded = Vec::new();
+    let mut spawned = Vec::new();
+
+    for id in &ids {
+        match db::get(&tx, *id) {
+            Ok(None) => errors.push((*id, "not found".to_string())),
+            Err(e) => errors.push((*id, format!("failed to fetch: {e}"))),
+            Ok(Some(_)) => {
+                let res = if done_state {
+                    db::complete_with_recurrence(&tx, *id, |due, rec| next_occurrence(due, rec))
+                        .map(|opt_new_id| {
+                            if let Some(new_id) = opt_new_id {
+                                spawned.push((*id, new_id));
+                            }
+                        })
+                } else {
+                    db::set_done(&tx, *id, false).map(|_| ())
+                };
+                match res {
+                    Ok(()) => succeeded.push(*id),
+                    Err(e) => errors.push((*id, format!("failed: {e}"))),
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        drop(tx);
+        eprintln!("No changes were committed. Errors:");
+        for (id, err) in errors {
+            eprintln!("  #{id}: {err}");
+        }
+        process::exit(1);
+    }
+
+    let action = if done_state { "done" } else { "undone" };
+    write_journal(
+        &tx,
+        action,
+        &serde_json::json!({"ids": &succeeded, "spawned": spawned.iter().map(|(_, new)| *new).collect::<Vec<_>>()}).to_string(),
+        &format!("{action} {}", succeeded.len()),
+    );
+
+    tx.commit()
+        .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+
+    let verb = if done_state { "done" } else { "pending" };
+    for id in &succeeded {
+        println!("Marked to-do #{id} as {verb}");
+    }
+    for (src, new) in &spawned {
+        println!("Recurrence: spawned #{new} from #{src}");
+    }
+}
+
+fn cmd_rm_multi(conn: &mut rusqlite::Connection, ids: Vec<i64>) {
+    let tx = conn
+        .transaction()
+        .unwrap_or_else(|e| fail(&format!("failed to start transaction: {e}")));
+
+    let mut errors = Vec::new();
+    let mut captured: Vec<serde_json::Value> = Vec::new();
+
+    for id in &ids {
+        match db::get(&tx, *id) {
+            Ok(None) => errors.push((*id, "not found".to_string())),
+            Err(e) => errors.push((*id, format!("failed to fetch: {e}"))),
+            Ok(Some(t)) => {
+                captured.push(render_json_value(&t));
+                if let Err(e) = db::delete(&tx, *id) {
+                    errors.push((*id, format!("failed: {e}")));
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        drop(tx);
+        eprintln!("No changes were committed. Errors:");
+        for (id, err) in errors {
+            eprintln!("  #{id}: {err}");
+        }
+        process::exit(1);
+    }
+
+    write_journal(
+        &tx,
+        "rm",
+        &serde_json::json!({"rows": captured}).to_string(),
+        &format!("rm {}", ids.len()),
+    );
+
+    tx.commit()
+        .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+
+    for id in ids {
+        println!("Deleted to-do #{id}");
+    }
+}
+
+fn cmd_snooze(conn: &mut rusqlite::Connection, ids: Vec<i64>, by: String) {
+    let (n, unit) = parse_relative(&by).unwrap_or_else(|| {
+        fail(&format!(
+            "invalid --by '{by}' — expected relative format (e.g. 1D, 1W, 2M, -3D)"
+        ))
+    });
+
+    let tx = conn
+        .transaction()
+        .unwrap_or_else(|e| fail(&format!("failed to start transaction: {e}")));
+
+    let mut errors = Vec::new();
+    let mut updates: Vec<(i64, String, String)> = Vec::new();
+
+    for id in &ids {
+        match db::get(&tx, *id) {
+            Ok(None) => errors.push((*id, "not found".to_string())),
+            Err(e) => errors.push((*id, format!("failed to fetch: {e}"))),
+            Ok(Some(t)) => {
+                let base = t
+                    .due_date
+                    .as_deref()
+                    .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                    .unwrap_or_else(|| chrono::Local::now().date_naive());
+                let shifted = match unit {
+                    'D' => base.checked_add_signed(chrono::Duration::days(n)),
+                    'W' => base.checked_add_signed(chrono::Duration::weeks(n)),
+                    'M' => {
+                        if n >= 0 {
+                            base.checked_add_months(chrono::Months::new(n as u32))
+                        } else {
+                            base.checked_sub_months(chrono::Months::new(n.unsigned_abs() as u32))
+                        }
+                    }
+                    'Y' => {
+                        let months = match n.checked_mul(12) {
+                            Some(m) => m,
+                            None => {
+                                errors.push((*id, format!("date overflow for '{by}'")));
+                                continue;
+                            }
+                        };
+                        if months >= 0 {
+                            base.checked_add_months(chrono::Months::new(months as u32))
+                        } else {
+                            base.checked_sub_months(
+                                chrono::Months::new(months.unsigned_abs() as u32),
+                            )
+                        }
+                    }
+                    _ => unreachable!("parse_relative guarantees unit"),
+                };
+                let Some(new_date) = shifted else {
+                    errors.push((*id, format!("date overflow for '{by}'")));
+                    continue;
+                };
+                let old = t.due_date.clone().unwrap_or_else(|| "—".into());
+                let new_str = new_date.format("%Y-%m-%d").to_string();
+                if let Err(e) = db::update_due_date(&tx, *id, Some(&new_str)) {
+                    errors.push((*id, format!("failed: {e}")));
+                } else {
+                    updates.push((*id, old, new_str));
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        drop(tx);
+        eprintln!("No changes were committed. Errors:");
+        for (id, err) in errors {
+            eprintln!("  #{id}: {err}");
+        }
+        process::exit(1);
+    }
+
+    let journal_payload = serde_json::json!({
+        "changes": updates.iter().map(|(id, old, _)| {
+            let prev = if old == "—" { serde_json::Value::Null } else { serde_json::Value::String(old.clone()) };
+            serde_json::json!({"id": id, "prev_due": prev})
+        }).collect::<Vec<_>>()
+    })
+    .to_string();
+    write_journal(
+        &tx,
+        "snooze",
+        &journal_payload,
+        &format!("snooze {} by {by}", updates.len()),
+    );
+
+    tx.commit()
+        .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+
+    for (id, old, new) in updates {
+        println!("Snoozed #{id}: {old} -> {new}");
+    }
+}
+
+fn cmd_next(conn: &rusqlite::Connection) {
+    let todos = db::list(
+        conn,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        false,
+        &[],
+        None,
+        Sort::Priority,
+    )
+    .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+    let Some(t) = todos.first() else {
+        println!("No pending items.");
+        return;
+    };
+    println!("ID:        {}", t.id);
+    println!("Priority:  {}", t.priority.label());
+    println!("Content:   {}", t.content);
+    println!("Due:       {}", t.due_date.as_deref().unwrap_or("—"));
+    let tags = t.tags_vec();
+    if !tags.is_empty() {
+        println!("Tags:      {}", tags.join(", "));
+    }
+    if let Some(n) = t.notes.as_deref() {
+        println!("Notes:     {n}");
+    }
+}
+
+fn cmd_stats(conn: &rusqlite::Connection) {
+    let (pending, done) = db::count_by_status(conn)
+        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+    let by_pri = db::count_pending_by_priority(conn)
+        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+
+    let today = chrono::Local::now().date_naive();
+    let today_s = today.format("%Y-%m-%d").to_string();
+    let week_s = (today + chrono::Duration::days(7))
+        .format("%Y-%m-%d")
+        .to_string();
+    let week_ago_s = (today - chrono::Duration::days(7))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let overdue = db::count_overdue(conn, &today_s)
+        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+    let due_today = db::count_due_range(conn, &today_s, &today_s)
+        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+    let due_week = db::count_due_range(conn, &today_s, &week_s)
+        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+    let completed_today = db::count_completed_since(conn, &today_s)
+        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+    let completed_week = db::count_completed_since(conn, &week_ago_s)
+        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+
+    println!("Total:      {}  ({pending} pending, {done} done)", pending + done);
+    println!("Overdue:    {overdue}");
+    println!("Due today:  {due_today}");
+    println!("Due week:   {due_week}");
+    println!("By priority (pending):");
+    let labels = ["1 (highest)", "2 (high)", "3 (medium)", "4 (low)", "5 (lowest)"];
+    for (i, count) in by_pri.iter().enumerate() {
+        if *count > 0 {
+            println!("  {:<12} {count}", labels[i]);
+        }
+    }
+    println!("Completed today:     {completed_today}");
+    println!("Completed this week: {completed_week}");
+}
+
+fn cmd_prune(conn: &mut rusqlite::Connection, older_than: String, dry_run: bool) {
+    let cutoff = resolve_date_signed(&older_than, -1)
+        .unwrap_or_else(|e| fail(&format!("invalid --older-than: {e}")));
+
+    if dry_run {
+        let n = db::count_done_older_than(conn, &cutoff)
+            .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+        println!("Would delete {n} done item(s) older than {cutoff}.");
+        return;
+    }
+
+    let tx = conn
+        .transaction()
+        .unwrap_or_else(|e| fail(&format!("failed to start transaction: {e}")));
+
+    // Capture rows before we delete them so undo can restore them.
+    let to_delete = db::list_done_older_than(&tx, &cutoff)
+        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+    let captured: Vec<serde_json::Value> = to_delete.iter().map(render_json_value).collect();
+
+    let removed = db::delete_done_older_than(&tx, &cutoff)
+        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+
+    if removed > 0 {
+        write_journal(
+            &tx,
+            "prune",
+            &serde_json::json!({"rows": captured}).to_string(),
+            &format!("prune {removed}"),
+        );
+    }
+
+    tx.commit()
+        .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+    println!("Deleted {removed} done item(s) older than {cutoff}.");
+}
+
+fn cmd_undo(conn: &mut rusqlite::Connection) {
+    let entry = db::read_journal(conn)
+        .unwrap_or_else(|e| fail(&format!("failed to read journal: {e}")));
+    let Some((action, payload, summary)) = entry else {
+        println!("Nothing to undo.");
+        return;
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&payload)
+        .unwrap_or_else(|e| fail(&format!("corrupt journal payload: {e}")));
+
+    let tx = conn
+        .transaction()
+        .unwrap_or_else(|e| fail(&format!("failed to start transaction: {e}")));
+
+    match action.as_str() {
+        "rm" | "prune" => {
+            let rows = parsed["rows"].as_array().cloned().unwrap_or_default();
+            for row in &rows {
+                restore_row(&tx, row);
+            }
+            db::clear_journal(&tx)
+                .unwrap_or_else(|e| fail(&format!("failed to clear journal: {e}")));
+            tx.commit()
+                .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+            println!("Undone: restored {} item(s) from '{summary}'", rows.len());
+        }
+        "edit" | "snooze" => {
+            if action == "edit" {
+                let before = &parsed["before"];
+                restore_row(&tx, before);
+            } else {
+                // snooze
+                let empty = Vec::new();
+                let changes = parsed["changes"].as_array().unwrap_or(&empty);
+                for ch in changes {
+                    let id = ch["id"].as_i64().unwrap_or(0);
+                    let prev = ch["prev_due"].as_str();
+                    db::update_due_date(&tx, id, prev)
+                        .unwrap_or_else(|e| fail(&format!("failed to restore due: {e}")));
+                }
+            }
+            db::clear_journal(&tx)
+                .unwrap_or_else(|e| fail(&format!("failed to clear journal: {e}")));
+            tx.commit()
+                .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+            println!("Undone: reversed '{summary}'");
+        }
+        "done" | "undone" => {
+            let empty = Vec::new();
+            let ids = parsed["ids"].as_array().unwrap_or(&empty);
+            let spawned = parsed["spawned"].as_array().unwrap_or(&empty);
+            // Flip state back.
+            let target = action == "undone"; // undoing 'undone' means set done=true
+            for idv in ids {
+                if let Some(id) = idv.as_i64() {
+                    db::set_done(&tx, id, target)
+                        .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+                }
+            }
+            // Remove any recurrence clones that were spawned by the original 'done'.
+            for idv in spawned {
+                if let Some(id) = idv.as_i64() {
+                    db::delete(&tx, id).ok();
+                }
+            }
+            db::clear_journal(&tx)
+                .unwrap_or_else(|e| fail(&format!("failed to clear journal: {e}")));
+            tx.commit()
+                .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+            println!("Undone: reversed '{summary}'");
+        }
+        other => fail(&format!("unknown journal action: {other}")),
+    }
+}
+
+/// Restore a row from a JSON object (as produced by `render_json_value`).
+fn restore_row(conn: &rusqlite::Connection, v: &serde_json::Value) {
+    let id = v["id"].as_i64().unwrap_or_else(|| fail("restore: missing id"));
+    let content = v["content"].as_str().unwrap_or("");
+    let priority = v["priority"].as_u64().unwrap_or(3) as u8;
+    let done = v["status"].as_str() == Some("done");
+    let due = v["due"].as_str();
+    let notes = v["notes"].as_str();
+    let tags_vec: Vec<String> = v["tags"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let tags_stored = if tags_vec.is_empty() {
+        None
     } else {
-        eprintln!("Nothing to update. Specify at least one field to change.");
-        eprintln!("Run `fazerei edit --help` for usage.");
-        process::exit(1);
-    }
+        Some(format!(",{},", tags_vec.join(",")))
+    };
+    let recurrence = v["recurrence"].as_str();
+    let created = v["created"].as_str().unwrap_or("");
+    let updated = v["updated"].as_str().unwrap_or("");
+    db::upsert_row(
+        conn,
+        id,
+        content,
+        priority,
+        done,
+        due,
+        notes,
+        tags_stored.as_deref(),
+        recurrence,
+        created,
+        updated,
+    )
+    .unwrap_or_else(|e| fail(&format!("failed to restore row #{id}: {e}")));
 }
 
-fn cmd_done_single(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
-    match db::get(conn, id) {
-        Ok(None) => return Err(format!("to-do #{id} not found")),
-        Err(e) => return Err(format!("failed to fetch to-do: {e}")),
-        Ok(Some(_)) => {}
-    }
-    db::set_done(conn, id, true).map_err(|e| format!("failed to mark to-do as done: {e}"))?;
-    Ok(())
+fn cmd_export(conn: &rusqlite::Connection) {
+    let todos = db::list(
+        conn,
+        true,
+        true,
+        None,
+        None,
+        None,
+        None,
+        true,
+        &[],
+        None,
+        Sort::Created,
+    )
+    .unwrap_or_else(|e| fail(&format!("failed: {e}")));
+    let objs: Vec<String> = todos.iter().map(render_json).collect();
+    println!("[{}]", objs.join(","));
 }
 
-fn cmd_done_multi(conn: &rusqlite::Connection, ids: Vec<i64>) {
-    let mut errors = Vec::new();
-    for id in ids {
-        match cmd_done_single(conn, id) {
-            Ok(()) => println!("Marked to-do #{id} as done"),
-            Err(e) => errors.push((id, e)),
-        }
-    }
-    if !errors.is_empty() {
-        eprintln!("Errors occurred:");
-        for (id, err) in errors {
-            eprintln!("  #{id}: {err}");
-        }
-        process::exit(1);
-    }
-}
+fn cmd_import(conn: &mut rusqlite::Connection, path: PathBuf) {
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| fail(&format!("failed to read {}: {e}", path.display())));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| fail(&format!("invalid JSON: {e}")));
+    let arr = parsed
+        .as_array()
+        .unwrap_or_else(|| fail("expected a JSON array at the top level"));
 
-fn cmd_undone_single(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
-    match db::get(conn, id) {
-        Ok(None) => return Err(format!("to-do #{id} not found")),
-        Err(e) => return Err(format!("failed to fetch to-do: {e}")),
-        Ok(Some(_)) => {}
-    }
-    db::set_done(conn, id, false).map_err(|e| format!("failed to revert to-do: {e}"))?;
-    Ok(())
-}
+    let tx = conn
+        .transaction()
+        .unwrap_or_else(|e| fail(&format!("failed to start transaction: {e}")));
 
-fn cmd_undone_multi(conn: &rusqlite::Connection, ids: Vec<i64>) {
-    let mut errors = Vec::new();
-    for id in ids {
-        match cmd_undone_single(conn, id) {
-            Ok(()) => println!("Marked to-do #{id} as pending"),
-            Err(e) => errors.push((id, e)),
-        }
+    let mut count = 0;
+    for v in arr {
+        let content = v["content"].as_str().unwrap_or_else(|| fail("missing content"));
+        let priority = v["priority"].as_u64().unwrap_or(3) as u8;
+        let done = v["status"].as_str() == Some("done");
+        let due = v["due"].as_str();
+        let notes = v["notes"].as_str();
+        let tags_vec: Vec<String> = v["tags"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tags_stored = if tags_vec.is_empty() {
+            None
+        } else {
+            Some(format!(",{},", tags_vec.join(",")))
+        };
+        let recurrence = v["recurrence"].as_str();
+        let now_str = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let created = v["created"].as_str().unwrap_or(&now_str);
+        let updated = v["updated"].as_str().unwrap_or(&now_str);
+        db::insert_full(
+            &tx,
+            content,
+            priority,
+            done,
+            due,
+            notes,
+            tags_stored.as_deref(),
+            recurrence,
+            created,
+            updated,
+        )
+        .unwrap_or_else(|e| fail(&format!("insert failed: {e}")));
+        count += 1;
     }
-    if !errors.is_empty() {
-        eprintln!("Errors occurred:");
-        for (id, err) in errors {
-            eprintln!("  #{id}: {err}");
-        }
-        process::exit(1);
-    }
-}
-
-fn cmd_rm_single(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
-    match db::get(conn, id) {
-        Ok(None) => return Err(format!("to-do #{id} not found")),
-        Err(e) => return Err(format!("failed to fetch to-do: {e}")),
-        Ok(Some(_)) => {}
-    }
-    db::delete(conn, id).map_err(|e| format!("failed to delete to-do: {e}"))?;
-    Ok(())
-}
-
-fn cmd_rm_multi(conn: &rusqlite::Connection, ids: Vec<i64>) {
-    let mut errors = Vec::new();
-    for id in ids {
-        match cmd_rm_single(conn, id) {
-            Ok(()) => println!("Deleted to-do #{id}"),
-            Err(e) => errors.push((id, e)),
-        }
-    }
-    if !errors.is_empty() {
-        eprintln!("Errors occurred:");
-        for (id, err) in errors {
-            eprintln!("  #{id}: {err}");
-        }
-        process::exit(1);
-    }
+    tx.commit()
+        .unwrap_or_else(|e| fail(&format!("failed to commit: {e}")));
+    println!("Imported {count} item(s).");
 }
 
 fn cmd_install_completion(shell: Shell, output: Option<std::path::PathBuf>) {
@@ -763,12 +1421,35 @@ fn cmd_install_completion(shell: Shell, output: Option<std::path::PathBuf>) {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Restore the default SIGPIPE handler so that closing the reader side of a
+/// pipe (e.g. `fazerei list | head -1`) terminates us cleanly instead of
+/// triggering Rust's default "Broken pipe" panic from println!.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: signal(2) with SIG_DFL is safe; no allocations or unwind.
+    unsafe {
+        // SIGPIPE = 13, SIG_DFL = 0 on all supported unix platforms. Avoid a
+        // libc dep by hardcoding the constants.
+        let _ = libc_signal(13, 0);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "signal"]
+    fn libc_signal(signum: i32, handler: usize) -> usize;
+}
+
 fn main() {
+    reset_sigpipe();
     CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
     let db_path = resolve_db_path(cli.db);
 
-    let conn = db::open(&db_path).unwrap_or_else(|e| {
+    let mut conn = db::open(&db_path).unwrap_or_else(|e| {
         fail(&format!(
             "failed to open database at {}: {e}",
             db_path.display()
@@ -781,18 +1462,31 @@ fn main() {
             priority,
             due,
             notes,
+            tags,
+            recur,
+            stdin,
         } => {
-            cmd_add(&conn, content, priority, due, notes);
+            cmd_add(&mut conn, content, priority, due, notes, tags, recur, stdin);
         }
         Commands::List {
             all,
             done,
             priority,
             due,
+            overdue,
+            today,
+            week,
             past,
+            tag,
+            search,
             include_nodate,
+            sort,
+            reverse,
             count,
             simple,
+            parsable,
+            fields,
+            json,
             full_date,
             priority_text,
         } => {
@@ -802,10 +1496,20 @@ fn main() {
                 done,
                 priority,
                 due,
+                overdue,
+                today,
+                week,
                 past,
+                tag,
+                search,
                 include_nodate,
+                sort,
+                reverse,
                 count,
                 simple,
+                parsable,
+                fields,
+                json,
                 full_date,
                 priority_text,
             );
@@ -819,18 +1523,51 @@ fn main() {
             priority,
             due,
             notes,
+            tags,
+            recur,
         } => {
-            let id = id.unwrap_or_else(|| fail("missing required argument: id"));
-            cmd_edit(&conn, id, content, priority, due, notes);
+            cmd_edit(&mut conn, id, content, priority, due, notes, tags, recur);
         }
         Commands::Done { ids } => {
-            cmd_done_multi(&conn, ids);
+            cmd_done_multi(&mut conn, ids, true);
         }
         Commands::Undone { ids } => {
-            cmd_undone_multi(&conn, ids);
+            cmd_done_multi(&mut conn, ids, false);
         }
         Commands::Rm { ids } => {
-            cmd_rm_multi(&conn, ids);
+            cmd_rm_multi(&mut conn, ids);
+        }
+        Commands::Snooze { ids, by } => {
+            cmd_snooze(&mut conn, ids, by);
+        }
+        Commands::Today => {
+            cmd_list(
+                &conn,
+                false, false, None, None, false, true, false, None,
+                Vec::new(), None, false, Sort::Due, false, false, false, false, None, false, false, false,
+            );
+        }
+        Commands::Next => {
+            cmd_next(&conn);
+        }
+        Commands::Stats => {
+            cmd_stats(&conn);
+        }
+        Commands::Prune {
+            done: _,
+            older_than,
+            dry_run,
+        } => {
+            cmd_prune(&mut conn, older_than, dry_run);
+        }
+        Commands::Undo => {
+            cmd_undo(&mut conn);
+        }
+        Commands::Export => {
+            cmd_export(&conn);
+        }
+        Commands::Import { path } => {
+            cmd_import(&mut conn, path);
         }
         Commands::InstallCompletion { shell, output } => {
             cmd_install_completion(shell, output);
