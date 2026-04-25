@@ -47,13 +47,32 @@ fn list_mutex_simple_and_parsable_is_rejected() {
 }
 
 #[test]
-fn list_mutex_fields_requires_parsable() {
+fn list_fields_applies_to_pretty_view() {
+    let db = tmp();
+    bin(&db).args(["add", "alpha", "-d", "2026-04-22"]).assert().success();
+
+    // --fields without --parsable now restricts the pretty table columns.
+    let out = bin(&db)
+        .args(["list", "--fields", "id,content"])
+        .output()
+        .unwrap()
+        .stdout;
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("alpha"), "content column should be present");
+    assert!(s.contains("Content"), "Content header should be present");
+    // Columns we did not select must not appear as headers.
+    assert!(!s.contains("Tags"), "Tags header should be hidden");
+    assert!(!s.contains("Updated"), "Updated header should be hidden");
+}
+
+#[test]
+fn list_mutex_fields_with_simple_is_rejected() {
     let db = tmp();
     bin(&db)
-        .args(["list", "--fields", "id"])
+        .args(["list", "--fields", "id", "--simple"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--parsable"));
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]

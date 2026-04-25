@@ -328,6 +328,7 @@ A bordered table with `# | status | priority | content | tags | due | updated | 
 
 - `--full-date` — render dates like "Wednesday, April 22, 2026"
 - `--priority-text` — render priority as e.g. "1 (highest)"
+- `--fields <list>` — restrict the table to a subset of columns (e.g. `--fields id,due,content`). Same field names as `--parsable`. Useful for fitting the table into narrow pop-up windows.
 
 ### `--simple`
 
@@ -352,7 +353,7 @@ fazerei list --parsable --fields id,tags,content
 # 42 work,urgent Review PR
 ```
 
-Fields: `id, status, priority, due, updated, created, tags, recurrence, content, notes`. Default: `id,status,due,content`. `--fields` requires `--parsable`.
+Fields: `id, status, priority, due, updated, created, tags, recurrence, content, notes`. Default: `id,status,due,content`. `--fields` also restricts the pretty (default) table view; it's only mutually exclusive with `--simple`, `--count`, and `--json`.
 
 ### `--json`
 

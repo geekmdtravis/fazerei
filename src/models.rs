@@ -181,6 +181,80 @@ impl Field {
     fn is_free_text(self) -> bool {
         matches!(self, Field::Content | Field::Notes)
     }
+
+    /// Header label used by the pretty-table view when `--fields` selects this column.
+    pub fn header(self) -> &'static str {
+        match self {
+            Field::Id => "#",
+            Field::Status => "",
+            Field::Priority => "Pri",
+            Field::Due => "Due",
+            Field::Updated => "Updated",
+            Field::Created => "Created",
+            Field::Tags => "Tags",
+            Field::Recurrence => "Recur",
+            Field::Content => "Content",
+            Field::Notes => "Notes",
+        }
+    }
+
+    /// Cell value for the pretty-table view. Mirrors the formatting of the
+    /// fixed `TodoRow` columns (overdue colorization, local timestamps,
+    /// truncation, em-dash for nulls).
+    pub fn render_pretty(self, t: &Todo, full_date: bool, priority_text: bool) -> String {
+        match self {
+            Field::Id => t.id.to_string(),
+            Field::Status => t.status_icon().to_string(),
+            Field::Priority => {
+                if priority_text {
+                    t.priority.label().to_string()
+                } else {
+                    t.priority.to_string()
+                }
+            }
+            Field::Due => format_due_date(t.due_date.as_deref(), t.done, full_date),
+            Field::Updated => format_ts_local(&t.updated_at),
+            Field::Created => format_ts_local(&t.created_at),
+            Field::Tags => {
+                let v = t.tags_vec();
+                if v.is_empty() {
+                    "—".into()
+                } else {
+                    truncate(&v.join(","), 30)
+                }
+            }
+            Field::Recurrence => t.recurrence.clone().unwrap_or_else(|| "—".into()),
+            Field::Content => truncate(&t.content, 50),
+            Field::Notes => match t.notes.as_deref() {
+                Some(n) => truncate(n, 50),
+                None => "—".into(),
+            },
+        }
+    }
+}
+
+/// Render the pretty (default) list view restricted to `fields`. Used when
+/// the user passes `--fields` without `--parsable` to fit the table into a
+/// narrower window.
+pub fn render_pretty_table(
+    todos: &[Todo],
+    fields: &[Field],
+    full_date: bool,
+    priority_text: bool,
+) -> String {
+    use tabled::builder::Builder;
+    use tabled::settings::Style;
+
+    let mut b = Builder::default();
+    b.push_record(fields.iter().map(|f| f.header().to_string()));
+    for t in todos {
+        b.push_record(
+            fields
+                .iter()
+                .map(|f| f.render_pretty(t, full_date, priority_text)),
+        );
+    }
+    b.build().with(Style::rounded()).to_string()
 }
 
 /// Row type used by `tabled` for the list view.

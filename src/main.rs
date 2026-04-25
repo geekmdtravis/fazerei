@@ -12,7 +12,7 @@ use tabled::{settings::Style, Table};
 
 use models::{
     format_ts_local, normalize_tags, render_json, render_json_value, render_parsable,
-    render_simple, Field, Priority, Sort, TodoRow,
+    render_pretty_table, render_simple, Field, Priority, Sort, TodoRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,9 +138,12 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["count", "simple", "json"])]
         parsable: bool,
 
-        /// Comma-separated list of fields for --parsable
-        /// (id,status,priority,due,updated,created,tags,content,notes)
-        #[arg(long, value_enum, value_delimiter = ',', requires = "parsable")]
+        /// Comma-separated list of columns to show. Applies to the pretty
+        /// (default) table and to --parsable. Useful for fitting the pretty
+        /// view into narrow pop-up windows.
+        /// (id,status,priority,due,updated,created,tags,recurrence,content,notes)
+        #[arg(long, value_enum, value_delimiter = ',',
+              conflicts_with_all = ["count", "simple", "json"])]
         fields: Option<Vec<Field>>,
 
         /// JSON array output (one object per item).
@@ -677,11 +680,15 @@ fn cmd_list(
         }
         return;
     }
-    let rows: Vec<TodoRow> = todos
-        .iter()
-        .map(|t| TodoRow::new(t, full_date, priority_text))
-        .collect();
-    let table = Table::new(rows).with(Style::rounded()).to_string();
+    let table = if let Some(f) = fields {
+        render_pretty_table(&todos, &f, full_date, priority_text)
+    } else {
+        let rows: Vec<TodoRow> = todos
+            .iter()
+            .map(|t| TodoRow::new(t, full_date, priority_text))
+            .collect();
+        Table::new(rows).with(Style::rounded()).to_string()
+    };
     println!("{table}");
 }
 
